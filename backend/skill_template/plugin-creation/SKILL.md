@@ -184,6 +184,10 @@ def get_plugin():
 | `register_frontend()` | 声明前端 JS/CSS 资源 |
 | `communicate_handler(payload, ctx)` | 处理前端 POST 请求 |
 
+配置中心的面板脚本（`window.pluginUI`）必须用 `api.registerPersistence({ plugin, save, apply?, reload? })`
+把面板草稿交给配置中心右上角的「保存 / 应用 / 重新加载」，并用返回 handle 的 `setDirty()` 报告未保存状态；
+**不要**在面板里再放一个独立的保存按钮（详见 `read("sourceCode://docs/plugin-api-reference.md")` 的「配置中心统一保存」）。
+
 ### 工具与中间件
 
 | Hook | 用途 |
@@ -262,6 +266,7 @@ ctx.vfs_list(path)                # 列出目录
 - 若插件需要工具、配置、路由、前端资源，请逐项对照源码接口后再实现
 - 如果要调用现有后端能力，优先通过 `sourceCode://backend/faust_backend/...` 阅读真实实现（目录可直接列出）
 - 如果要暴露前端资源，必须同时检查插件管理路由与前端资源收集逻辑
+- 插件前端面板不要自建保存按钮：保存/应用/重新加载统一走配置中心的 `registerPersistence`
 - 如果要落地配置，必须先注册 schema，再读写配置值
 
 ## 安装/重载流程

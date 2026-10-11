@@ -155,9 +155,9 @@
     }).join('') || '<tr><td colspan="4">暂无规则</td></tr>';
     return '<table class="simple-table"><thead><tr><th>启用</th><th>规则</th><th>类型</th><th>冷却</th></tr></thead><tbody>'
       + rows + '</tbody></table>'
-      + '<div class="toolbar"><button id="desktop-rule-save" class="btn btn-secondary">保存规则开关</button>'
-      + '<span class="card-help">引擎不会自动调整冷却：觉得某条太吵就关掉它、调高它的 cooldown_sec。'
-      + '类型为「即时附加」的规则命中时不会说话、不弹窗、不打断：文本先入队，随后随你的下一条消息或前台触发器送达（后台触发器不附加），整段最多 100 字。</span></div>';
+      + '<p class="card-help">引擎不会自动调整冷却：觉得某条太吵就关掉它、调高它的 cooldown_sec。'
+      + '类型为「即时附加」的规则命中时不会说话、不弹窗、不打断：文本先入队，随后随你的下一条消息或前台触发器送达（后台触发器不附加），整段最多 100 字。'
+      + '改完按右上角「保存」提交。</p>';
   }
 
   function renderAttach(attach){
@@ -206,9 +206,8 @@
   function render(container){
     container.innerHTML = ''
       + '<article class="card full-span"><h3 class="card-title">感知引擎 · 桌宠能看什么</h3>'
-      + '<p class="card-help">三级隐私开关决定允许采集的范围；每个感知源还能单独关闭。被关闭的源不会写进 faustbot://desktop-mood/（总览见 overview.md），依赖它的规则不会触发。保存后下一个心跳周期（≤10 秒）生效。</p>'
+      + '<p class="card-help">三级隐私开关决定允许采集的范围；每个感知源还能单独关闭。被关闭的源不会写进 faustbot://desktop-mood/（总览见 overview.md），依赖它的规则不会触发。修改后按右上角「保存」，下一个心跳周期（≤10 秒）生效。</p>'
       + '<div id="desktop-tier-list" class="desktop-tier-list">加载中...</div>'
-      + '<div class="toolbar"><button id="desktop-perception-save" class="btn btn-primary">保存感知设置</button></div>'
       + '</article>'
       + '<article class="card full-span"><h3 class="card-title">场景与时间线</h3><div id="desktop-narrative-box">加载中...</div></article>'
       + '<article class="card full-span"><h3 class="card-title">今日节律</h3><div id="desktop-rhythm-box" class="desktop-metric-row">加载中...</div></article>'
@@ -225,16 +224,88 @@
       + '补充内容就在「规则」卡片里加一条 kind 为 attach 的规则。</p></article>'
       + '<article class="card full-span"><h3 class="card-title">其他配置</h3>'
       + '<div class="toolbar"><label>当前情绪 <select id="desktop-mood-select"><option value="auto">自动</option><option value="rainy">雨天</option><option value="warm">温暖</option><option value="dark">低沉</option></select></label>'
-      + '<button id="desktop-mood-save" class="btn btn-secondary">保存情绪</button>'
       + '<label>全局冷却 <input id="desktop-global-cooldown" type="number" min="0" style="width:80px" /></label>'
       + '<label>天气城市 <input id="desktop-weather-city" type="text" style="width:100px" /></label>'
       + '<label>编码监视目录 <input id="desktop-code-dir" type="text" style="width:220px" placeholder="D:\\some\\git\\repo" /></label>'
-      + '<button id="desktop-other-save" class="btn btn-primary">保存</button></div>'
-      + '<p class="card-help">规则文件位于 ~/.faustbot/desktop-mood.rules.json（由 faustbot://plugins/desktop-mood/reload 提交写入）。</p></article>';
+      + '</div>'
+      + '<p class="card-help">规则开关、当前情绪与这里的配置都在右上角「保存」时一并提交。规则文件位于 ~/.faustbot/desktop-mood.rules.json（由 faustbot://plugins/desktop-mood/reload 提交写入）。</p></article>';
 
     let latest = { perception: null, state: {}, config: {} };
     let tierDirty = false;
     let rulesDirty = false;
+    let moodDirty = false;
+    let otherDirty = false;
+
+    // 面板草稿交给配置中心右上角的「保存」：本页不再有独立保存按钮
+    const persist = api.registerPersistence({
+      plugin: 'desktop-mood',
+      module: 'desktop-mood',
+      save: async function(){
+        // 规则开关与当前情绪是插件自己的状态文件，感知分级与其它配置走插件 config
+        if (rulesDirty) {
+          const res = await communicate({ action: 'set_rules', items: collectRules() });
+          if (!res || res.status !== 'ok') throw new Error('保存规则失败：' + ((res && res.detail) || '未知错误'));
+          rulesDirty = false;
+        }
+        if (moodDirty) {
+          const select = document.getElementById('desktop-mood-select');
+          const res = await communicate({ action: 'set_mood', mood: (select && select.value) || 'auto' });
+          if (!res || res.status !== 'ok') throw new Error('保存情绪失败：' + ((res && res.detail) || '未知错误'));
+          moodDirty = false;
+        }
+        if (tierDirty || otherDirty) {
+          const res = await saveConfig(collectPerceptionValues());
+          if (!res || res.status !== 'ok') throw new Error('保存感知设置失败：' + ((res && res.detail) || '未知错误'));
+          tierDirty = false;
+          otherDirty = false;
+        }
+        syncDirty();
+      }
+    });
+
+    function syncDirty(){
+      persist.setDirty(tierDirty || rulesDirty || moodDirty || otherDirty);
+    }
+
+    function collectRules(){
+      return (latest.rules || []).map(function(item){
+        const box = container.querySelector('input[data-rule-id="' + item.id + '"]');
+        const next = Object.assign({}, item, { enabled: !!(box && box.checked) });
+        delete next.summary;
+        return next;
+      });
+    }
+
+    function isMoodDirty(){
+      const select = document.getElementById('desktop-mood-select');
+      if (!select) return false;
+      return String(select.value) !== String((latest.state || {}).manual_mood || 'auto');
+    }
+
+    function isOtherDirty(){
+      const cfg = latest.config || {};
+      const cooldown = (document.getElementById('desktop-global-cooldown') || {}).value;
+      const city = (document.getElementById('desktop-weather-city') || {}).value;
+      const codeDir = (document.getElementById('desktop-code-dir') || {}).value;
+      return String(cooldown) !== String(cfg.GLOBAL_COOLDOWN_SEC != null ? cfg.GLOBAL_COOLDOWN_SEC : 180)
+        || String(city) !== String(cfg.WEATHER_CITY != null ? cfg.WEATHER_CITY : 'auto')
+        || String(codeDir) !== String(cfg.CODE_WATCH_DIR || '');
+    }
+
+    const moodSelect = document.getElementById('desktop-mood-select');
+    if (moodSelect) {
+      moodSelect.addEventListener('change', function(){
+        moodDirty = isMoodDirty();
+        syncDirty();
+      });
+    }
+    ['desktop-global-cooldown', 'desktop-weather-city', 'desktop-code-dir'].forEach(function(id){
+      const node = document.getElementById(id);
+      if (node) node.addEventListener('input', function(){
+        otherDirty = isOtherDirty();
+        syncDirty();
+      });
+    });
 
     function bindPerceptionPanel(perception){
       const tierList = document.getElementById('desktop-tier-list');
@@ -246,16 +317,17 @@
           Array.prototype.forEach.call(sourceToggles, function(item){ item.disabled = !toggle.checked; });
           if (group) group.classList.toggle('is-muted', !toggle.checked);
           tierDirty = true;
+          syncDirty();
         };
       });
       Array.prototype.forEach.call(container.querySelectorAll('input[data-source-toggle]'), function(toggle){
-        toggle.onchange = function(){ tierDirty = true; };
+        toggle.onchange = function(){ tierDirty = true; syncDirty(); };
       });
     }
 
     function bindRulesPanel(){
       Array.prototype.forEach.call(container.querySelectorAll('input[data-rule-id]'), function(toggle){
-        toggle.onchange = function(){ rulesDirty = true; };
+        toggle.onchange = function(){ rulesDirty = true; syncDirty(); };
       });
     }
 
@@ -291,47 +363,16 @@
       const attachBox = document.getElementById('desktop-attach-box');
       if (attachBox) attachBox.innerHTML = renderAttach(perception.attach);
 
+      // 有草稿的字段不被刷新覆盖（否则 5 秒一次的心跳刷新会吃掉用户改动）
       const select = document.getElementById('desktop-mood-select');
-      if (select) select.value = state.manual_mood || 'auto';
+      if (select && !moodDirty) select.value = state.manual_mood || 'auto';
       const globalCooldown = document.getElementById('desktop-global-cooldown');
-      if (globalCooldown) globalCooldown.value = String(configValues.GLOBAL_COOLDOWN_SEC != null ? configValues.GLOBAL_COOLDOWN_SEC : 180);
+      if (globalCooldown && !otherDirty) globalCooldown.value = String(configValues.GLOBAL_COOLDOWN_SEC != null ? configValues.GLOBAL_COOLDOWN_SEC : 180);
       const weatherCity = document.getElementById('desktop-weather-city');
-      if (weatherCity) weatherCity.value = String(configValues.WEATHER_CITY != null ? configValues.WEATHER_CITY : 'auto');
+      if (weatherCity && !otherDirty) weatherCity.value = String(configValues.WEATHER_CITY != null ? configValues.WEATHER_CITY : 'auto');
       const codeDir = document.getElementById('desktop-code-dir');
-      if (codeDir) codeDir.value = String(configValues.CODE_WATCH_DIR || '');
+      if (codeDir && !otherDirty) codeDir.value = String(configValues.CODE_WATCH_DIR || '');
 
-      const saveMood = document.getElementById('desktop-mood-save');
-      if (saveMood) saveMood.onclick = async function(){
-        await communicate({ action: 'set_mood', mood: document.getElementById('desktop-mood-select').value });
-        refresh();
-      };
-      const saveRules = document.getElementById('desktop-rule-save');
-      if (saveRules) saveRules.onclick = async function(){
-        const items = rules.map(function(item){
-          const box = container.querySelector('input[data-rule-id="' + item.id + '"]');
-          const next = Object.assign({}, item, { enabled: !!(box && box.checked) });
-          delete next.summary;
-          return next;
-        });
-        await communicate({ action: 'set_rules', items: items });
-        rulesDirty = false;
-        refresh();
-      };
-      const savePerception = document.getElementById('desktop-perception-save');
-      if (savePerception) savePerception.onclick = async function(){
-        await saveConfig(collectPerceptionValues());
-        tierDirty = false;
-        refresh();
-      };
-      const saveOther = document.getElementById('desktop-other-save');
-      if (saveOther) saveOther.onclick = async function(){
-        await saveConfig({
-          GLOBAL_COOLDOWN_SEC: Number((document.getElementById('desktop-global-cooldown') || {}).value || 180),
-          WEATHER_CITY: (document.getElementById('desktop-weather-city') || {}).value || 'auto',
-          CODE_WATCH_DIR: (document.getElementById('desktop-code-dir') || {}).value || ''
-        });
-        refresh();
-      };
       const refreshPerception = document.getElementById('desktop-perception-refresh');
       if (refreshPerception) refreshPerception.onclick = async function(){
         await fetchJson('/faust/admin/plugins/heartbeat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });

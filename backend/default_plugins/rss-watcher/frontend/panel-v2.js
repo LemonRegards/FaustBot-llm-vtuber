@@ -12,11 +12,13 @@
   }
 
   async function saveConfig(values){
-    return fetchJson('/faust/admin/plugins/rss-watcher/config', {
+    const res = await fetchJson('/faust/admin/plugins/rss-watcher/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ values: values, apply_runtime: true, no_initial_chat: true, reset_dialog: false })
     });
+    if (!res || res.status !== 'ok') throw new Error((res && res.detail) || '配置保存失败');
+    return res;
   }
 
   function feedTableRows(feeds){
@@ -92,7 +94,7 @@
       <input class="input" id="rss-category-filter" placeholder="all / tech / news" />
     </label>
 
-    <button type="button" id="rss-save-config" class="btn btn-primary" style="align-self:flex-start;margin-top:4px">保存配置</button>
+    <p class="card-help">修改后按右上角「保存」写入插件配置。</p>
   </div>
 </article>
 
@@ -111,6 +113,60 @@
   <table class="simple-table"><thead><tr><th>标题</th><th>来源</th><th>链接</th><th>操作</th></tr></thead><tbody id="rss-item-list"></tbody></table>
 </article>`;
 
+    // 推送配置的草稿交给配置中心右上角的「保存」：本页不再有独立保存按钮
+    const CONFIG_INPUT_IDS = ['rss-threshold', 'rss-interval', 'rss-quiet-start', 'rss-quiet-end', 'rss-category-filter'];
+    let baseline = null;
+
+    function readConfigInput(id){
+      const node = document.getElementById(id);
+      return node ? String(node.value) : '';
+    }
+
+    function collectConfigValues(){
+      return {
+        PUSH_THRESHOLD: Number(readConfigInput('rss-threshold') || 3),
+        FETCH_INTERVAL_MIN: Number(readConfigInput('rss-interval') || 15),
+        QUIET_START: readConfigInput('rss-quiet-start') || '23:00',
+        QUIET_END: readConfigInput('rss-quiet-end') || '08:00',
+        CATEGORY_FILTER: readConfigInput('rss-category-filter') || 'all'
+      };
+    }
+
+    function applyConfigInputs(configValues){
+      const values = configValues || {};
+      const mapping = {
+        'rss-threshold': String(values.PUSH_THRESHOLD ?? 3),
+        'rss-interval': String(values.FETCH_INTERVAL_MIN ?? 15),
+        'rss-quiet-start': String(values.QUIET_START ?? '23:00'),
+        'rss-quiet-end': String(values.QUIET_END ?? '08:00'),
+        'rss-category-filter': String(values.CATEGORY_FILTER ?? 'all')
+      };
+      Object.keys(mapping).forEach(function(id){
+        const node = document.getElementById(id);
+        if (node) node.value = mapping[id];
+      });
+    }
+
+    function isConfigDirty(){
+      return baseline !== null && JSON.stringify(collectConfigValues()) !== JSON.stringify(baseline);
+    }
+
+    const persist = api.registerPersistence({
+      plugin: 'rss-watcher',
+      module: 'rss-watcher',
+      save: async function(ctx){
+        if (!ctx || !ctx.dirty) return;
+        await saveConfig(collectConfigValues());
+        baseline = collectConfigValues();
+        persist.setDirty(false);
+        await refresh();
+      }
+    });
+    CONFIG_INPUT_IDS.forEach(function(id){
+      const node = document.getElementById(id);
+      if (node) node.addEventListener('input', function(){ persist.setDirty(isConfigDirty()); });
+    });
+
     async function refresh(){
       const results = await Promise.all([
         communicate({ action: 'get_feeds' }),
@@ -126,28 +182,11 @@
       const itemList = document.getElementById('rss-item-list');
       const digestEl = document.getElementById('rss-digest');
       if (digestEl) digestEl.textContent = digest;
-      const threshold = document.getElementById('rss-threshold');
-      const interval = document.getElementById('rss-interval');
-      const quietStart = document.getElementById('rss-quiet-start');
-      const quietEnd = document.getElementById('rss-quiet-end');
-      const categoryFilter = document.getElementById('rss-category-filter');
-      if (threshold) threshold.value = String(configValues.PUSH_THRESHOLD ?? 3);
-      if (interval) interval.value = String(configValues.FETCH_INTERVAL_MIN ?? 15);
-      if (quietStart) quietStart.value = String(configValues.QUIET_START ?? '23:00');
-      if (quietEnd) quietEnd.value = String(configValues.QUIET_END ?? '08:00');
-      if (categoryFilter) categoryFilter.value = String(configValues.CATEGORY_FILTER ?? 'all');
-      const saveConfigBtn = document.getElementById('rss-save-config');
-      if (saveConfigBtn) {
-        saveConfigBtn.onclick = async function(){
-          await saveConfig({
-            PUSH_THRESHOLD: Number(threshold && threshold.value || 3),
-            FETCH_INTERVAL_MIN: Number(interval && interval.value || 15),
-            QUIET_START: quietStart && quietStart.value || '23:00',
-            QUIET_END: quietEnd && quietEnd.value || '08:00',
-            CATEGORY_FILTER: categoryFilter && categoryFilter.value || 'all'
-          });
-          refresh();
-        };
+      // 有未保存草稿时不覆盖输入框（避免刷新吃掉用户已经改好的值）
+      if (!isConfigDirty()) {
+        applyConfigInputs(configValues);
+        baseline = collectConfigValues();
+        persist.setDirty(false);
       }
       if (feedList) {
         feedList.innerHTML = feedTableRows(feeds);

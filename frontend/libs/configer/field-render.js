@@ -141,10 +141,13 @@ function updateValue(scope, key, nextValue) {
 }
 
 function refreshDirtyUI() {
+  // 插件面板注册的草稿（window.pluginUI.registerPersistence）也算未保存修改
+  const pluginCount = (typeof pluginDirtyCount === "function") ? pluginDirtyCount() : 0;
   const count = state.dirty.public.size + state.dirty.private.size
     + (state.dirty.providers ? 1 : 0)
     + (state.dirty.mainModel ? 1 : 0)
-    + (state.dirty.subagentModels ? 1 : 0);
+    + (state.dirty.subagentModels ? 1 : 0)
+    + pluginCount;
   if (count <= 0) {
     els.dirtyBadge.classList.add("hidden");
     els.dirtyBadge.textContent = "0 项配置已修改";

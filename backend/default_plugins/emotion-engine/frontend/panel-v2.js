@@ -134,7 +134,20 @@
     desc: '实时情绪、趋势和配置快照',
     plugin: 'emotion-engine',
     render: function(container){
-      container.innerHTML = '<article class="card full-span"><h3 class="card-title">Emotion Engine</h3><p class="card-help">显示当前主导情绪、近 24 小时变化与配置状态。拖动情绪条可直接修改情绪值。</p><div id="emotion-metrics" class="data-grid-compact"></div><div id="emotion-bars"></div></article><article class="card full-span"><h3 class="card-title">情绪配置</h3><div class="data-grid-compact"><div class="metric"><span class="metric-label">衰减速度</span><span class="metric-value" id="emotion-decay-state">0.10</span></div></div><div class="toolbar"><label>情绪衰减（每分钟，0 表示不衰减）<input id="emotion-decay" type="number" step="0.05" min="0" max="10" /></label><button id="emotion-save" class="btn btn-primary">保存配置</button><span id="emotion-save-status" class="card-help"></span></div></article><article class="card full-span"><h3 class="card-title">24 小时趋势</h3><div id="emotion-trend" style="width:100%;height:260px;"></div></article>';
+      container.innerHTML = '<article class="card full-span"><h3 class="card-title">Emotion Engine</h3><p class="card-help">显示当前主导情绪、近 24 小时变化与配置状态。拖动情绪条可直接修改情绪值。</p><div id="emotion-metrics" class="data-grid-compact"></div><div id="emotion-bars"></div></article><article class="card full-span"><h3 class="card-title">情绪配置</h3><div class="data-grid-compact"><div class="metric"><span class="metric-label">衰减速度</span><span class="metric-value" id="emotion-decay-state">0.10</span></div></div><div class="toolbar"><label>情绪衰减（每分钟，0 表示不衰减）<input id="emotion-decay" type="number" step="0.05" min="0" max="10" /></label></div><p class="card-help">修改后按右上角「保存」写入插件配置。</p></article><article class="card full-span"><h3 class="card-title">24 小时趋势</h3><div id="emotion-trend" style="width:100%;height:260px;"></div></article>';
+
+      // 草稿交给配置中心右上角的「保存」：本面板不再有独立保存按钮
+      const persist = api.registerPersistence({
+        plugin: 'emotion-engine',
+        module: 'emotion-engine',
+        save: async function(ctx){
+          if (!ctx || !ctx.dirty) return;
+          const input = document.getElementById('emotion-decay');
+          await saveConfig({ DECAY_PER_MINUTE: Number((input && input.value) || 0.1) });
+          persist.setDirty(false);
+        }
+      });
+
       Promise.all([fetchState(), fetchConfig()]).then(function(results){
         const payload = results[0] || {};
         const cfgPayload = (results[1] || {}).config || {};
@@ -147,21 +160,14 @@
         const values = (cfgPayload.values || {});
         const decay = document.getElementById('emotion-decay');
         const decayState = document.getElementById('emotion-decay-state');
-        const status = document.getElementById('emotion-save-status');
-        if (decay) decay.value = String(values.DECAY_PER_MINUTE ?? 0.1);
-        if (decayState) decayState.textContent = Number(values.DECAY_PER_MINUTE ?? 0.1).toFixed(2);
-        const saveBtn = document.getElementById('emotion-save');
-        if (saveBtn) {
-          saveBtn.onclick = async function(){
-            if (status) { status.textContent = '保存中…'; status.style.color = ''; }
-            try {
-              await saveConfig({ DECAY_PER_MINUTE: Number(decay && decay.value || 0.1) });
-              if (status) status.textContent = '已保存，立即生效';
-            } catch (error) {
-              if (status) { status.textContent = '保存失败：' + error.message; status.style.color = '#e54447'; }
-            }
-          };
+        const baselineDecay = Number(values.DECAY_PER_MINUTE ?? 0.1);
+        if (decay) {
+          decay.value = String(baselineDecay);
+          decay.addEventListener('input', function(){
+            persist.setDirty(Number(decay.value || 0) !== baselineDecay);
+          });
         }
+        if (decayState) decayState.textContent = baselineDecay.toFixed(2);
         drawTrend(document.getElementById('emotion-trend'), history);
       }).catch(function(error){
         container.innerHTML = '<article class="card full-span"><h3 class="card-title">Emotion Engine</h3><p class="card-help">无法获取情绪状态</p></article>';

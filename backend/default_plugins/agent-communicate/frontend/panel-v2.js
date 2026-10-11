@@ -190,6 +190,21 @@
     const expandedAgents = {};   // { [agentName]: true } —— 行内"命令与配置"展开状态
     const renderedHtml = {};     // { [key]: html } —— 内容没变就不重建 DOM（少闪烁、不打断点击）
 
+    // agents 表格的草稿交给配置中心右上角的「保存」：本页不再有独立保存按钮
+    const persist = api.registerPersistence({
+      plugin: PLUGIN_ID,
+      module: PLUGIN_ID,
+      save: async function (ctx) {
+        if (!ctx || !ctx.dirty) return;
+        await saveAgents();
+      }
+    });
+
+    function setAgentsDirty(value) {
+      agentsDirty = !!value;
+      persist.setDirty(agentsDirty);
+    }
+
     container.innerHTML = `
 <section class="agent-communicate-error" data-ac="error" hidden></section>
 
@@ -342,9 +357,9 @@
       </div>
       <div class="toolbar">
         <button class="btn btn-ghost" data-ac-action="config-add">新增 Agent</button>
-        <button class="btn btn-primary" data-ac-action="config-save">保存 agents 配置</button>
         <span class="card-help agent-communicate-config-status" data-ac="config-status"></span>
       </div>
+      <p class="card-help">表格里的改动按配置中心右上角「保存」提交到插件配置。</p>
     </div>
   </details>
 </article>
@@ -1105,14 +1120,12 @@
     function renderConfig() {
       const tbody = $('[data-ac="config-rows"]');
       const hint = $('[data-ac="config-hint"]');
-      const saveBtn = $('[data-ac-action="config-save"]');
       const addBtn = $('[data-ac-action="config-add"]');
       const blocked = !!configParseError || configReadOnly;
       if (hint) {
         hint.textContent = configParseError
           || (configReadOnly ? '读不到插件配置（get_state 未返回 agents，管理接口也不可用），为避免用空表覆盖原有 agents 已停用编辑与保存。' : '');
       }
-      if (saveBtn) saveBtn.disabled = blocked;
       if (addBtn) addBtn.disabled = blocked;
       if (!tbody) return;
       if (loadFailed) {
@@ -1408,35 +1421,33 @@
       const res = await call({ action: 'agents_save', agents: rows });
       if (!res) { await refresh(); return; }
       configAgents = rows;
-      agentsDirty = false;
+      setAgentsDirty(false);
       renderedConfigSig = rowsSignature(rows);
       setNotice('Agent「' + name + '」已' + (enabled ? '启用' : '停用') + detailSuffix(res));
       await refresh();
     }
 
-    async function saveAgents(button) {
+    async function saveAgents() {
       if (configReadOnly || configParseError) {
-        setError('读不到当前 agents 配置，已拒绝保存以免覆盖原值', 'action:config-save');
+        const message = '读不到当前 agents 配置，已拒绝保存以免覆盖原值';
+        setError(message, 'save');
         setConfigStatus('已拒绝保存（配置不可读）', true);
-        return;
+        throw new Error(message);
       }
       const built = buildAgentsPayload();
       if (built.error) {
-        setError(built.error, 'action:config-save');
+        setError(built.error, 'save');
         setConfigStatus('校验失败：' + built.error, true);
-        return;
+        throw new Error(built.error);
       }
       setConfigStatus('保存中…', true);
-      const res = await withBusy(button, function () {
-        return call({ action: 'agents_save', agents: built.rows });
-      });
+      const res = await call({ action: 'agents_save', agents: built.rows }, { source: 'save' });
       if (!res) {
         setConfigStatus('保存失败（见上方错误信息）', true);
-        await refresh();
-        return;
+        throw new Error('agents_save 未成功（详见面板错误信息）');
       }
       configAgents = built.rows;
-      agentsDirty = false;
+      setAgentsDirty(false);
       renderedConfigSig = rowsSignature(built.rows);
       setConfigStatus('已保存', false);
       setNotice('agents 配置已保存' + detailSuffix(res));
@@ -1515,7 +1526,7 @@
             task_timeout_sec: 1800,
             permission_timeout_sec: 300
           });
-          agentsDirty = true;
+          setAgentsDirty(true);
           renderedConfigSig = null;
           renderConfig();
           setConfigStatus('有未保存的修改', true);
@@ -1524,15 +1535,12 @@
           const index = toInt(el.getAttribute('data-ac-index'), -1);
           if (index < 0 || index >= configAgents.length) break;
           configAgents.splice(index, 1);
-          agentsDirty = true;
+          setAgentsDirty(true);
           renderedConfigSig = null;
           renderConfig();
           setConfigStatus('有未保存的修改', true);
           break;
         }
-        case 'config-save':
-          await saveAgents(el);
-          break;
         case 'discover-refresh': {
           const res = await withBusy(el, function () {
             return call({ action: 'discover_refresh' });
@@ -1562,7 +1570,7 @@
       if (field === 'enabled') row.enabled = !!el.checked;
       else if (field === 'name' || field === 'command' || field === 'cwd') row[field] = el.value;
       else row[field] = el.value;
-      agentsDirty = true;
+      setAgentsDirty(true);
       setConfigStatus('有未保存的修改', true);
     }
 

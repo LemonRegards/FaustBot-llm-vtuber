@@ -17,7 +17,8 @@
     "build:soullink": "esbuild libs/soullink/.soullink-entry.js --bundle --platform=browser --format=iife --outfile=libs/soullink.bundle.js --minify-syntax",
     "build:soullink-main": "esbuild libs/soullink/.profile-generator-entry.js --bundle --platform=node --format=cjs --outfile=libs/soullink/profile-generator.cjs --minify-syntax",
     "package": "npm run build:bundle && electron-builder --win dir",
-    "check-js": "node scripts/check-js-syntax.js"
+    "check-js": "node scripts/check-js-syntax.js",
+    "check-persistence": "node scripts/check-plugin-persistence.js"
   },
   "devDependencies": {
     "@codemirror/commands": "^6.10.4",

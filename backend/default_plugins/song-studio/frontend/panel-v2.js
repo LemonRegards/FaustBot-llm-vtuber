@@ -78,34 +78,40 @@
     refInput.type = 'text';
     refInput.placeholder = '参考音频绝对路径（留空使用 TTS 参考音频）';
     refInput.style.minWidth = '360px';
-    const refSaveBtn = el('button', 'btn btn-primary', '保存');
-    refToolbar.append(refInput, refSaveBtn);
+    refToolbar.append(refInput);
     refCard.appendChild(refToolbar);
-    refCard.appendChild(el('p', 'card-help', '更换参考音色后，已转换歌曲需要重新转换才会使用新音色。'));
+    refCard.appendChild(el('p', 'card-help', '修改后按配置中心右上角「保存」提交。更换参考音色后，已转换歌曲需要重新转换才会使用新音色。'));
     container.appendChild(refCard);
 
-    refSaveBtn.onclick = async () => {
-      refSaveBtn.disabled = true;
-      try {
+    // 参考音色草稿交给配置中心右上角的「保存」：本页不再有独立保存按钮
+    let refBaseline = null;
+    const refIsDirty = () => refBaseline !== null && refInput.value.trim() !== refBaseline;
+    const persist = api.registerPersistence({
+      plugin: PLUGIN_ID,
+      module: PLUGIN_ID,
+      save: async (ctx) => {
+        if (!ctx || !ctx.dirty) return;
+        const value = refInput.value.trim();
         const res = await fetch(api.backendBaseUrl + '/faust/admin/plugins/song-studio/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            values: { REF_AUDIO_PATH: refInput.value.trim() },
+            values: { REF_AUDIO_PATH: value },
             apply_runtime: true,
             no_initial_chat: true,
             reset_dialog: false,
           }),
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
+        refBaseline = value;
+        persist.setDirty(false);
         refStatus.textContent = '已保存';
-      } catch (e) {
-        refStatus.textContent = '保存失败: ' + e.message;
-      } finally {
-        refSaveBtn.disabled = false;
         refresh();
-      }
-    };
+      },
+    });
+    refInput.addEventListener('input', () => {
+      persist.setDirty(refBaseline !== null && refInput.value.trim() !== refBaseline);
+    });
 
     const singingCard = el('article', 'card full-span');
     singingCard.appendChild(el('h3', 'card-title', '演唱状态'));
@@ -321,7 +327,12 @@
             : '未在演唱';
           stopBtn.disabled = !status.singing;
           sourceHint.textContent = '曲库目录: ' + status.source_dir;
-          if (document.activeElement !== refInput) refInput.value = status.ref_audio_config || '';
+          // 有草稿时不用服务端值覆盖输入框（否则任何刷新都会吃掉用户改动）
+          if (!refIsDirty() && document.activeElement !== refInput) {
+            refInput.value = status.ref_audio_config || '';
+            refBaseline = refInput.value.trim();
+            persist.setDirty(false);
+          }
           refStatus.textContent = status.ref_audio
             ? '当前生效: ' + status.ref_audio + (status.ref_audio_config ? '' : '（来自 TTS 参考音频）')
             : '不可用: ' + (status.ref_audio_error || '未配置');

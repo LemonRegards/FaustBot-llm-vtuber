@@ -49,6 +49,7 @@ FaustBot 插件可以在以下层面扩展和修改系统：
 |------|------|
 | 注册 UI 小组件 | 在主界面添加自定义小组件（徽章、面板等） |
 | 注入前端脚本 | 加载自定义 JS/CSS 修改前端行为 |
+| 接入配置中心保存 | 面板草稿交给配置中心右上角的「保存 / 应用 / 重新加载」，不要自建保存按钮 |
 | 前后端通信 | 通过 `communicate` 接口与后端交互 |
 
 ### 5. 定时任务
@@ -299,8 +300,9 @@ curl -X POST http://localhost:13900/faust/admin/plugins/package-zip \
 ### 前端集成
 
 1. **小组件**：使用 `registerWidget` 注册 UI 小组件（`managed` 缺省为 `true`，定位/显隐/缩放由小组件管理器统一处理，无需自写 rAF 布局循环；详见 plugin-api-reference.md）
-2. **通信**：通过 `communicate_handler` 处理前端请求
-3. **样式**：使用独立 CSS 文件，避免全局样式污染
+2. **配置中心面板**：面板上的草稿用 `window.pluginUI.registerPersistence({ plugin, save })` 交给配置中心右上角的「保存 / 应用 / 重新加载」，并用 `setDirty()` 报告未保存状态；**不要**在面板里再放一个独立的保存按钮（详见 plugin-api-reference.md 的「配置中心统一保存」）
+3. **通信**：通过 `communicate_handler` 处理前端请求
+4. **样式**：使用独立 CSS 文件，避免全局样式污染
 
 ### 安全性
 

@@ -11,6 +11,7 @@
 - [Hook 完整参考](#hook-完整参考)
 - [数据结构](#数据结构)
 - [前后端通信](#前后端通信)
+- [配置中心统一保存](#配置中心统一保存保存应用重新加载)
 - [UI 小组件 API](#ui-小组件-api)
 - [Admin API](#admin-api)
 - [默认插件示例](#默认插件示例)
@@ -309,6 +310,10 @@ def register_frontend(self) -> list[dict]:
         {"type": "css", "path": "/faust/plugins/my-plugin/frontend/panel.css"},
     ]
 ```
+
+> 配置中心的面板（`window.pluginUI`）请用 `registerPersistence()` 把保存交给右上角的
+> 「保存 / 应用 / 重新加载」，不要自建保存按钮，详见
+> [配置中心统一保存](#配置中心统一保存保存应用重新加载)。
 
 #### `communicate_handler(payload: dict, ctx: PluginContext) -> dict | None`
 
@@ -791,6 +796,65 @@ const result = await window.faustAppUI.communicate('my-plugin', {
   action: 'get_context'
 });
 ```
+
+### 配置中心统一保存（保存/应用/重新加载）
+
+**插件自己的面板不要自建保存按钮**。`window.pluginUI.registerPersistence()` 把面板上的草稿交给
+配置中心右上角的三个按钮：它们的语义与全局配置完全一致，插件无需重复实现一套保存 UI，
+也不会因为漏点插件自己的按钮而丢改动。
+
+```javascript
+// 在插件页面的 render(container) 里注册（页面每次重渲染都会重新注册）
+const persist = api.registerPersistence({
+  plugin: 'my-plugin',          // 必需：插件 id
+  module: 'my-plugin',          // 可选：缺省 = plugin；离开该页面自动注销
+  save: async (ctx) => {        // 「保存」：把草稿落盘
+    if (!ctx.dirty) return;     // 没有草稿就别写盘 / 别重建运行时
+    await postMyConfig(collectDraft());
+    persist.setDirty(false);
+  },
+  apply: async (ctx) => {       // 「应用」：可选，让已保存内容立即生效
+    await reloadMyRuntime();
+  },
+  reload: async (ctx) => {      // 「重新加载」：可选，丢弃草稿并重新读取
+    persist.setDirty(false);
+  },
+});
+
+// 用户改动草稿时报告未保存状态 → 右上角徽标显示「N 项配置已修改」，「保存」不再空转
+input.addEventListener('input', () => persist.setDirty(true));
+```
+
+处理器收到的 `ctx`：`{ phase: 'save'|'apply'|'reload', plugin, module, dirty }`。
+`dirty` 是该插件当前是否报告过未保存修改——「保存」会因为任意页面的全局配置改动而触发，
+没有草稿的插件应当直接 `return`，否则每次保存都会做一次无谓写盘（配置接口 `apply_runtime=true` 还会重建运行时）。
+
+| 参数 | 必需 | 说明 |
+|------|------|------|
+| `plugin` | 是 | 插件 id；用于去重与失败上报 |
+| `module` | 否 | 该处理器所属的配置中心页面 id，缺省等于 `plugin` |
+| `save` | 否 | 点击「保存」时调用 |
+| `apply` | 否 | 点击「应用」时调用 |
+| `reload` | 否 | 点击「重新加载」时调用 |
+
+返回的 handle：
+
+| 方法 | 说明 |
+|------|------|
+| `setDirty(bool)` | 报告本插件是否有未保存修改（计入右上角 dirty 徽标，影响「保存」是否空转、以及「重新加载」的丢失确认） |
+| `dispose()` | 主动注销该处理器（通常不需要：离开页面会自动注销） |
+
+行为约定：
+
+- **只触发注册了对应阶段的插件**：没注册 `apply` 的插件在点「应用」时不会被调用。
+- **页面重渲染即覆盖旧处理器**：同一 `plugin + module` 重复注册视为替换，避免对着已销毁的 DOM 保存。
+- **离开页面自动注销**：切换配置中心页面后，该页注册的处理器与它的 dirty 标记一起失效（页面 DOM 已被销毁）；
+  下一次进入该页重新注册。
+- **抛错即失败，但不吞掉也不连坐**：处理器抛出的异常会以 `插件名（错误信息）` 的形式显示在配置中心横幅里，
+  同时保留该插件的 dirty 标记；其它插件与全局配置的保存照常进行。想让保存失败就 `throw new Error(...)`。
+- **保存顺序**：插件 `save` 先各自落盘，再写全局配置（两者互不依赖）。
+- **刷新不要吃掉草稿**：面板自身的定时/手动刷新在 `setDirty(true)` 期间不要用服务端值覆盖输入框，
+  否则用户改到一半会被刷新重置。
 
 ### SSE 流式通道（sse-communicate）
 
