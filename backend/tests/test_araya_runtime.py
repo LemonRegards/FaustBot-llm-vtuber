@@ -358,3 +358,49 @@ def test_araya_state_migration_seeds_watermark_from_last_trigger(monkeypatch, tm
     state = runtime._load_state()
     assert state["last_maintenance_ts"] == 999.5
     assert runtime.maintenance_watermark(state) == 999.5
+
+
+def test_araya_agent_mounts_tool_call_repair_middleware(monkeypatch, tmp_path):
+    """回归：Araya 必须与主 Agent 共用同一套消息兜底中间件。
+
+    缺 ToolCallRepairMiddleware 时，工具执行被中断遗留的悬空 tool_calls 会
+    原样发给上游，直接 400 invalid_request_error。
+    """
+    import asyncio
+
+    from langchain.agents.middleware import ModelRetryMiddleware
+
+    from faust_backend.runtime.mm_bridge import MultimodalBridgeMiddleware
+    from faust_backend.runtime.tool_call_repair import ToolCallRepairMiddleware
+
+    _prepare_araya_prompt(tmp_path)
+    monkeypatch.setattr(araya_runtime.conf, "CONFIG_ROOT", str(tmp_path))
+    monkeypatch.setattr(araya_runtime.conf, "AGENT_NAME", "faust")
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            self.model_name = kwargs.get("model")
+
+    import faust_backend.provider as provider_mod
+
+    async def _fake_build_main_chat_model(providers, intensity=None):
+        return FakeChatOpenAI(model="fake-model")
+
+    captured: dict = {}
+
+    def _fake_create_agent(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(provider_mod, "build_main_chat_model", _fake_build_main_chat_model)
+    monkeypatch.setattr(araya_runtime, "create_agent", _fake_create_agent)
+    monkeypatch.setattr(araya_runtime.ArayaRuntime, "_build_tools", lambda self: [])
+
+    asyncio.run(araya_runtime.ArayaRuntime()._init_agent())
+
+    middlewares = captured["middleware"]
+    kinds = [type(item) for item in middlewares]
+    assert ToolCallRepairMiddleware in kinds
+    assert MultimodalBridgeMiddleware in kinds
+    # 重试必须最贴近真实模型调用（链尾），只重放模型请求本身
+    assert isinstance(middlewares[-1], ModelRetryMiddleware)

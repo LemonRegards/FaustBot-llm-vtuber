@@ -667,6 +667,7 @@ class ArayaRuntime:
         from faust_backend.provider import build_main_chat_model
         from faust_backend.runtime.middleware import wrap_tools
         from faust_backend.runtime.mm_bridge import MultimodalBridgeMiddleware
+        from faust_backend.runtime.tool_call_repair import ToolCallRepairMiddleware
         self._chat_model = await build_main_chat_model(
             runtime_state.get_model_providers(), intensity=None
         )
@@ -675,7 +676,12 @@ class ArayaRuntime:
             model=self._chat_model,
             # 与主 Agent 同一套输出管线：工具输出进 OutputStore，图片经桥接注入
             tools=wrap_tools(self._build_tools()),
-            middleware=with_model_retry([MultimodalBridgeMiddleware()]),
+            # 与主 Agent 同一套兜底：工具执行被中断等遗留的悬空 tool_calls
+            # 必须在模型调用前修复，否则上游直接 400 invalid_request_error
+            middleware=with_model_retry([
+                MultimodalBridgeMiddleware(),
+                ToolCallRepairMiddleware(),
+            ]),
         )
 
     async def _close_model(self) -> None:

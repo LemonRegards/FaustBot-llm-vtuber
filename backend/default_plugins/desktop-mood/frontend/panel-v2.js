@@ -203,7 +203,24 @@
       + errorLine;
   }
 
+  // 当前活动实例：页面重渲染后旧实例的定时器与在途请求靠它自杀
+  let RENDER_TOKEN = 0;
+
   function render(container){
+    // 容器是复用的：切走页面时宿主只清空 innerHTML（div 仍挂在文档里），再次
+    // 进入又会调用一次 render()。每次渲染递增 token，旧实例的 5s 定时器据此
+    // 自停——否则旧闭包会继续按服务端状态重画面板，把用户还没点「保存」的勾选
+    // 覆盖掉（表现为页面"不断重载"）。
+    const token = ++RENDER_TOKEN;
+    function isAlive(){
+      return token === RENDER_TOKEN
+        && container.isConnected
+        && container.childElementCount > 0
+        && container.style.display !== 'none';
+    }
+    // 所有查询都限定在本页容器内：旧实例即使残留，也只可能写进自己的空容器
+    function $(selector){ return container.querySelector(selector); }
+
     container.innerHTML = ''
       + '<article class="card full-span"><h3 class="card-title">感知引擎 · 桌宠能看什么</h3>'
       + '<p class="card-help">三级隐私开关决定允许采集的范围；每个感知源还能单独关闭。被关闭的源不会写进 faustbot://desktop-mood/（总览见 overview.md），依赖它的规则不会触发。修改后按右上角「保存」，下一个心跳周期（≤10 秒）生效。</p>'
@@ -248,7 +265,7 @@
           rulesDirty = false;
         }
         if (moodDirty) {
-          const select = document.getElementById('desktop-mood-select');
+          const select = $('#desktop-mood-select');
           const res = await communicate({ action: 'set_mood', mood: (select && select.value) || 'auto' });
           if (!res || res.status !== 'ok') throw new Error('保存情绪失败：' + ((res && res.detail) || '未知错误'));
           moodDirty = false;
@@ -277,22 +294,22 @@
     }
 
     function isMoodDirty(){
-      const select = document.getElementById('desktop-mood-select');
+      const select = $('#desktop-mood-select');
       if (!select) return false;
       return String(select.value) !== String((latest.state || {}).manual_mood || 'auto');
     }
 
     function isOtherDirty(){
       const cfg = latest.config || {};
-      const cooldown = (document.getElementById('desktop-global-cooldown') || {}).value;
-      const city = (document.getElementById('desktop-weather-city') || {}).value;
-      const codeDir = (document.getElementById('desktop-code-dir') || {}).value;
+      const cooldown = ($('#desktop-global-cooldown') || {}).value;
+      const city = ($('#desktop-weather-city') || {}).value;
+      const codeDir = ($('#desktop-code-dir') || {}).value;
       return String(cooldown) !== String(cfg.GLOBAL_COOLDOWN_SEC != null ? cfg.GLOBAL_COOLDOWN_SEC : 180)
         || String(city) !== String(cfg.WEATHER_CITY != null ? cfg.WEATHER_CITY : 'auto')
         || String(codeDir) !== String(cfg.CODE_WATCH_DIR || '');
     }
 
-    const moodSelect = document.getElementById('desktop-mood-select');
+    const moodSelect = $('#desktop-mood-select');
     if (moodSelect) {
       moodSelect.addEventListener('change', function(){
         moodDirty = isMoodDirty();
@@ -300,7 +317,7 @@
       });
     }
     ['desktop-global-cooldown', 'desktop-weather-city', 'desktop-code-dir'].forEach(function(id){
-      const node = document.getElementById(id);
+      const node = $('#' + id);
       if (node) node.addEventListener('input', function(){
         otherDirty = isOtherDirty();
         syncDirty();
@@ -308,7 +325,7 @@
     });
 
     function bindPerceptionPanel(perception){
-      const tierList = document.getElementById('desktop-tier-list');
+      const tierList = $('#desktop-tier-list');
       if (tierList) tierList.innerHTML = renderTierGroups(perception);
       Array.prototype.forEach.call(container.querySelectorAll('input[data-tier-toggle]'), function(toggle){
         toggle.onchange = function(){
@@ -332,12 +349,15 @@
     }
 
     async function refresh(){
+      if (!isAlive()) return;
       const results = await Promise.all([
         communicate({ action: 'get_perception' }),
         communicate({ action: 'get_state' }),
         fetchJson('/faust/admin/plugins/desktop-mood/config'),
         communicate({ action: 'get_rules' })
       ]);
+      // 在途请求回来时页面可能已被切走或重渲染：旧实例不得再写 DOM
+      if (!isAlive()) return;
       const perception = results[0].perception || {};
       const state = results[1].state || {};
       const configValues = (((results[2] || {}).config || {}).values) || {};
@@ -345,35 +365,35 @@
       latest = { perception: perception, state: state, config: configValues, rules: rules };
 
       if (!tierDirty) bindPerceptionPanel(perception);
-      const rows = document.getElementById('desktop-perception-rows');
+      const rows = $('#desktop-perception-rows');
       if (rows) rows.innerHTML = renderCollectionTable(perception);
-      const stamp = document.getElementById('desktop-perception-stamp');
+      const stamp = $('#desktop-perception-stamp');
       if (stamp) stamp.textContent = agoText(perception.updated_at);
-      const narrative = document.getElementById('desktop-narrative-box');
+      const narrative = $('#desktop-narrative-box');
       if (narrative) narrative.innerHTML = renderTimeline(perception);
-      const rhythm = document.getElementById('desktop-rhythm-box');
+      const rhythm = $('#desktop-rhythm-box');
       if (rhythm) rhythm.innerHTML = renderRhythm(perception);
-      const disturb = document.getElementById('desktop-disturb-box');
+      const disturb = $('#desktop-disturb-box');
       if (disturb) disturb.innerHTML = renderDisturb(perception);
-      const rulesBox = document.getElementById('desktop-rules-box');
+      const rulesBox = $('#desktop-rules-box');
       if (rulesBox && !rulesDirty) {
         rulesBox.innerHTML = renderRules(rules);
         bindRulesPanel();
       }
-      const attachBox = document.getElementById('desktop-attach-box');
+      const attachBox = $('#desktop-attach-box');
       if (attachBox) attachBox.innerHTML = renderAttach(perception.attach);
 
       // 有草稿的字段不被刷新覆盖（否则 5 秒一次的心跳刷新会吃掉用户改动）
-      const select = document.getElementById('desktop-mood-select');
+      const select = $('#desktop-mood-select');
       if (select && !moodDirty) select.value = state.manual_mood || 'auto';
-      const globalCooldown = document.getElementById('desktop-global-cooldown');
+      const globalCooldown = $('#desktop-global-cooldown');
       if (globalCooldown && !otherDirty) globalCooldown.value = String(configValues.GLOBAL_COOLDOWN_SEC != null ? configValues.GLOBAL_COOLDOWN_SEC : 180);
-      const weatherCity = document.getElementById('desktop-weather-city');
+      const weatherCity = $('#desktop-weather-city');
       if (weatherCity && !otherDirty) weatherCity.value = String(configValues.WEATHER_CITY != null ? configValues.WEATHER_CITY : 'auto');
-      const codeDir = document.getElementById('desktop-code-dir');
+      const codeDir = $('#desktop-code-dir');
       if (codeDir && !otherDirty) codeDir.value = String(configValues.CODE_WATCH_DIR || '');
 
-      const refreshPerception = document.getElementById('desktop-perception-refresh');
+      const refreshPerception = $('#desktop-perception-refresh');
       if (refreshPerception) refreshPerception.onclick = async function(){
         await fetchJson('/faust/admin/plugins/heartbeat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         refresh();
@@ -382,9 +402,9 @@
 
     function collectPerceptionValues(){
       const values = {
-        GLOBAL_COOLDOWN_SEC: Number((document.getElementById('desktop-global-cooldown') || {}).value || 180),
-        WEATHER_CITY: (document.getElementById('desktop-weather-city') || {}).value || 'auto',
-        CODE_WATCH_DIR: (document.getElementById('desktop-code-dir') || {}).value || ''
+        GLOBAL_COOLDOWN_SEC: Number(($('#desktop-global-cooldown') || {}).value || 180),
+        WEATHER_CITY: ($('#desktop-weather-city') || {}).value || 'auto',
+        CODE_WATCH_DIR: ($('#desktop-code-dir') || {}).value || ''
       };
       Array.prototype.forEach.call(container.querySelectorAll('input[data-tier-toggle]'), function(toggle){
         values['ENABLE_TIER_' + toggle.getAttribute('data-tier-toggle').toUpperCase()] = !!toggle.checked;
@@ -407,10 +427,11 @@
     }
 
     refresh().catch(function(){
+      if (!isAlive()) return;
       container.innerHTML = '<article class="card full-span"><h3 class="card-title">感知引擎</h3><p class="card-help">桌面插件状态读取失败</p></article>';
     });
     const timer = setInterval(function(){
-      if (!document.body.contains(container)) { clearInterval(timer); return; }
+      if (!isAlive()) { clearInterval(timer); return; }
       refresh().catch(function(){});
     }, 5000);
   }
