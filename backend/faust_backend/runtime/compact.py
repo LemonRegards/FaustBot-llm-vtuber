@@ -24,6 +24,12 @@
 
 5. **失败不隐瞒也不打断**：重试后仍失败则不改动 checkpoint，本轮继续，
    错误写入日志；随后上游若真的报 context_length_exceeded，照常暴露给用户。
+
+6. **压缩请求自己修复 tool_calls**：压缩调用直接打 provider、不经过中间件链，
+   因此 payload 构造前先过一遍 `repair_dangling_tool_calls`。checkpoint 里
+   允许存在悬空的 `AIMessage(tool_calls)`（工具执行被中断、压缩前遗留），
+   主模型调用由 `ToolCallRepairMiddleware` 兜住，压缩调用若不自修复就会
+   收到 400 invalid_request_error，导致压缩永远失败。
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import override
 
 from faust_backend.logger import get_logger
+from faust_backend.runtime.tool_call_repair import repair_dangling_tool_calls
 
 log = get_logger("faust.compact")
 
@@ -229,13 +236,16 @@ class CompactMiddleware(SummarizationMiddleware):
         关键：payload 前缀与主请求逐字节一致（同样的 System、同样的工具 schema），
         这样这次调用能命中上游的前缀缓存。
 
+        压缩调用不经过中间件链，因此这里自己修复悬空的 tool_calls；修复放在
+        追加指令**之前**，使序列结尾的悬空走「注入占位」而不是被判为打断作废。
+
         Args:
             on_delta: 可选回调，收到增量文本时调用。自动压缩路径不传（由
                 lifecycle 的流式生产者按 tag 分流）；手动 /compact 路径传入，
                 因为它不在 graph 运行中，拿不到 astream_events。
         """
         payload: list[AnyMessage] = [
-            *messages,
+            *repair_dangling_tool_calls(list(messages)),
             HumanMessage(content=COMPACT_INSTRUCTION),
         ]
         runnable = (

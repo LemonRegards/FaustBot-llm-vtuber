@@ -234,7 +234,7 @@ def load_configs():
     global MIMO_TTS_FORMAT, MIMO_TTS_REFER_WAV_PATH, MIMO_ASR_BASE_URL, MIMO_ASR_MODEL, MIMO_ASR_LANGUAGE
     global MIMO_API_KEY
     global FAUSTBOT_CLOUD_BASE_URL, FAUSTBOT_CLOUD_TIMEOUT_SECONDS
-    global MM_BRIDGE_MAX_SCAN, MM_BRIDGE_REMOVE_SOURCE, MM_BRIDGE_KEEP_TURNS, MM_BRIDGE_MAX_PIXELS
+    global MM_BRIDGE_MAX_SCAN, MM_BRIDGE_MAX_PIXELS
     global REASONING_CONFIG
     global COMPACT_THRESHOLD_RATIO, COMPACT_KEEP_ROUNDS
     global PLUGIN_MARKET_USE_GH_PROXY
@@ -272,8 +272,6 @@ def load_configs():
     BM25_ONLY = bool(config.get('BM25_ONLY', False))
     ARAYA_ENABLED = bool(config.get('ARAYA_ENABLED', True))
     MM_BRIDGE_MAX_SCAN = int(config.get('MM_BRIDGE_MAX_SCAN', 6) or 6)
-    MM_BRIDGE_REMOVE_SOURCE = bool(config.get('MM_BRIDGE_REMOVE_SOURCE', False))
-    MM_BRIDGE_KEEP_TURNS = int(config.get('MM_BRIDGE_KEEP_TURNS', 2) or 2)
     MM_BRIDGE_MAX_PIXELS = int(config.get('MM_BRIDGE_MAX_PIXELS', 2000000) or 2000000)
     MCP_SERVERS = copy.deepcopy(config.get('mcp_servers', {}) or {})
     ARAYA_IDLE_MINUTES = float(config.get('ARAYA_IDLE_MINUTES', 30) or 30)

@@ -344,3 +344,80 @@ def test_abefore_model_degrades_on_failure():
         _ai("a2", tokens=950),
     ]
     assert asyncio.run(mw.abefore_model({"messages": messages}, None)) is None
+
+
+# ── 6. 压缩请求自修复悬空 tool_calls（回归：上游 400 invalid_request_error） ──
+
+
+def _tool_call_violations(messages: list) -> list[str]:
+    """OpenAI 约束校验：assistant 的每个 tool_call 必须在遇到下一条非 tool
+    消息之前被对应的 ToolMessage 响应。返回违规描述（空列表 = 合法）。"""
+    problems: list[str] = []
+    pending: set[str] = set()
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            if pending:
+                problems.append(f"未响应 {sorted(pending)} 就出现新的 AIMessage")
+            pending = {tc["id"] for tc in (msg.tool_calls or [])}
+        elif isinstance(msg, ToolMessage):
+            pending.discard(msg.tool_call_id)
+        else:
+            if pending:
+                problems.append(
+                    f"未响应 {sorted(pending)} 就出现 {type(msg).__name__}"
+                )
+            pending = set()
+    if pending:
+        problems.append(f"序列结尾未响应 {sorted(pending)}")
+    return problems
+
+
+def test_compact_call_repairs_dangling_tool_calls_mid_history():
+    """被打断的悬空 tool_calls：压缩 payload 里必须被作废，不能原样发给上游。"""
+    fake = _FakeStream()
+    mw = _make_middleware(fake=fake, keep_rounds=1, context_length=1000, threshold_ratio=0.5)
+    messages = [
+        SystemMessage(content="sys", id="s1"),
+        HumanMessage(content="r1", id="h1"),
+        _ai("", tool_calls=[{"id": "c1", "name": "read_file", "args": {"path": "x"}}]),
+        # ← 缺少 ToolMessage("c1")：mm_bridge 删除源消息 / 工具执行被中断的遗留
+        HumanMessage(content="r2", id="h2"),
+        _ai("a2", tokens=950),
+    ]
+    assert _tool_call_violations(messages), "测试前提：入参 state 本身违规"
+
+    asyncio.run(mw.abefore_model({"messages": messages}, None))
+    assert fake.calls, "压缩调用没有发生"
+    sent = fake.calls[0]
+    assert _tool_call_violations(sent) == []
+    # 被打断 → 作废而不是注入占位
+    assert not any(isinstance(m, ToolMessage) for m in sent)
+
+
+def test_compact_call_placeholder_for_trailing_dangling_tool_calls():
+    """序列结尾的悬空 tool_calls：压缩 payload 必须补占位 ToolMessage。"""
+    fake = _FakeStream()
+    mw = _make_middleware(fake=fake, keep_rounds=1, context_length=1000, threshold_ratio=0.5)
+    messages = [
+        SystemMessage(content="sys", id="s1"),
+        HumanMessage(content="r1", id="h1"),
+        _ai("a1", tokens=900),
+        HumanMessage(content="r2", id="h2"),
+        _ai(
+            "",
+            tokens=950,
+            tool_calls=[{"id": "c9", "name": "read_file", "args": {"path": "x"}}],
+        ),
+    ]
+    assert _tool_call_violations(messages), "测试前提：入参 state 本身违规"
+
+    asyncio.run(mw.abefore_model({"messages": messages}, None))
+    assert fake.calls, "压缩调用没有发生"
+    sent = fake.calls[0]
+    assert _tool_call_violations(sent) == []
+    placeholder_ids = {
+        m.tool_call_id for m in sent if isinstance(m, ToolMessage)
+    }
+    assert "c9" in placeholder_ids, "结尾悬空必须注入占位 ToolMessage"
+    assert isinstance(sent[-1], HumanMessage), "指令必须是最后一条"
+    assert isinstance(sent[-2], ToolMessage), "占位必须排在指令之前"

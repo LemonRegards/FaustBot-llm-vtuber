@@ -11,11 +11,16 @@ from faust_backend.runtime.middleware import wrap_tools
 from faust_backend.runtime.tool_call_repair import (
     PLACEHOLDER_CONTENT,
     ToolCallRepairMiddleware,
+    repair_dangling_tool_calls,
 )
 
 
 def _ai(content: str = "", tool_calls: list[dict] | None = None) -> AIMessage:
     return AIMessage(content=content, tool_calls=tool_calls or [])
+
+
+def _ai_invalid(content: str = "", invalid: list[dict] | None = None) -> AIMessage:
+    return AIMessage(content=content, invalid_tool_calls=invalid or [])
 
 
 def _tool(tool_call_id: str, content: str = "ok") -> ToolMessage:
@@ -33,7 +38,7 @@ def test_complete_sequence_is_unchanged():
         _tool("t1", "file content"),
         _ai("done"),
     ]
-    repaired = ToolCallRepairMiddleware._repair_messages(messages)
+    repaired = repair_dangling_tool_calls(messages)
     assert repaired == messages
 
 
@@ -44,7 +49,7 @@ def test_interrupted_tool_call_is_voided_not_placeholder():
         _ai("", [{"id": "t1", "name": "read", "args": {}}]),
         HumanMessage(content="hello?"),
     ]
-    repaired = ToolCallRepairMiddleware._repair_messages(messages)
+    repaired = repair_dangling_tool_calls(messages)
     tool_ids = _tool_ids(repaired)
     assert "t1" not in tool_ids, "被打断的调用不应注入占位"
     assert not any(isinstance(m, ToolMessage) for m in repaired)
@@ -67,7 +72,7 @@ def test_partial_response_then_interrupt_voids_remaining():
         _tool("t1"),
         HumanMessage(content="continue"),
     ]
-    repaired = ToolCallRepairMiddleware._repair_messages(messages)
+    repaired = repair_dangling_tool_calls(messages)
     tool_ids = _tool_ids(repaired)
     assert "t1" in tool_ids
     assert "t2" not in tool_ids, "未执行的 t2 应作废而不是注入占位"
@@ -80,8 +85,10 @@ def test_dangling_tool_calls_at_end_get_placeholder():
         HumanMessage(content="hi"),
         _ai("", [{"id": "t1", "name": "read", "args": {}}]),
     ]
-    repaired = ToolCallRepairMiddleware._repair_messages(messages)
+    repaired = repair_dangling_tool_calls(messages)
     assert "t1" in _tool_ids(repaired)
+    placeholder = next(m for m in repaired if isinstance(m, ToolMessage))
+    assert placeholder.content == PLACEHOLDER_CONTENT
 
 
 def test_orphan_tool_message_is_dropped():
@@ -90,7 +97,7 @@ def test_orphan_tool_message_is_dropped():
         _tool("ghost"),
         _ai("done"),
     ]
-    repaired = ToolCallRepairMiddleware._repair_messages(messages)
+    repaired = repair_dangling_tool_calls(messages)
     assert "ghost" not in _tool_ids(repaired)
     assert any(isinstance(m, AIMessage) for m in repaired)
 
@@ -102,7 +109,7 @@ def test_tool_message_with_unknown_id_after_pending_is_dropped():
         _tool("t2", "unexpected"),
         HumanMessage(content="continue"),
     ]
-    repaired = ToolCallRepairMiddleware._repair_messages(messages)
+    repaired = repair_dangling_tool_calls(messages)
     tool_ids = _tool_ids(repaired)
     assert "t2" not in tool_ids
     # t1 被后面的 HumanMessage 打断 → 作废，不再注入占位
@@ -116,8 +123,60 @@ def test_original_list_not_mutated():
         HumanMessage(content="hello?"),
     ]
     snapshot = list(messages)
-    ToolCallRepairMiddleware._repair_messages(messages)
+    repair_dangling_tool_calls(messages)
     assert messages == snapshot
+
+
+# ── invalid_tool_calls（参数解析失败）同样会被序列化成 tool_calls ──
+
+
+def _invalid(tool_call_id: str, name: str = "read_file") -> dict:
+    return {
+        "id": tool_call_id,
+        "name": name,
+        "args": "{not-json",
+        "error": "Failed to parse tool call arguments as JSON",
+    }
+
+
+def test_trailing_invalid_tool_call_gets_placeholder():
+    """回归：只带 invalid_tool_calls 的悬空调用必须被响应，否则上游 400。"""
+    messages = [
+        HumanMessage(content="hi"),
+        _ai_invalid("", [_invalid("bad1")]),
+    ]
+    repaired = repair_dangling_tool_calls(messages)
+    assert "bad1" in _tool_ids(repaired)
+    placeholder = next(m for m in repaired if isinstance(m, ToolMessage))
+    assert placeholder.name == "read_file"
+
+
+def test_interrupted_invalid_tool_call_is_voided():
+    messages = [
+        HumanMessage(content="hi"),
+        _ai_invalid("", [_invalid("bad1")]),
+        HumanMessage(content="继续"),
+    ]
+    repaired = repair_dangling_tool_calls(messages)
+    assert not any(isinstance(m, ToolMessage) for m in repaired)
+    ai = next(m for m in repaired if isinstance(m, AIMessage))
+    assert ai.invalid_tool_calls == []
+
+
+def test_valid_and_invalid_tool_calls_in_same_message():
+    """同一条 AIMessage 同时带 tool_calls 与 invalid_tool_calls 时两条都要配平。"""
+    message = AIMessage(
+        content="",
+        tool_calls=[{"id": "t1", "name": "read", "args": {}}],
+        invalid_tool_calls=[_invalid("bad1")],
+    )
+    messages = [HumanMessage(content="hi"), message, _tool("t1")]
+    repaired = repair_dangling_tool_calls(messages)
+    assert _tool_ids(repaired) == {"t1", "bad1"}
+    # 已响应的 t1 保持，未响应的 bad1 由占位补齐
+    ai = next(m for m in repaired if isinstance(m, AIMessage))
+    assert [tc["id"] for tc in ai.tool_calls] == ["t1"]
+    assert [tc["id"] for tc in ai.invalid_tool_calls] == ["bad1"]
 
 
 def test_wrap_tools_skips_non_base_tool_without_crashing():

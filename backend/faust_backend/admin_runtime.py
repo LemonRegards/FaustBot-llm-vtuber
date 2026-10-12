@@ -57,8 +57,6 @@ PUBLIC_CONFIG_DEFAULTS = {
     "BM25_ONLY": False,
     "ARAYA_ENABLED": True,
     "MM_BRIDGE_MAX_SCAN": 6,
-    "MM_BRIDGE_REMOVE_SOURCE": False,
-    "MM_BRIDGE_KEEP_TURNS": 2,
     "MM_BRIDGE_MAX_PIXELS": 640000,#800*800 for deepseek-v4-flash-vision-exp
     "ARAYA_IDLE_MINUTES": 30,
     "AUTO_FORCE_INTERRUPT": True,

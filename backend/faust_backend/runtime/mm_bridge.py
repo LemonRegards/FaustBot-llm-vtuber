@@ -6,30 +6,41 @@ multimodal blocks so vision-capable LLMs can see tool-returned images directly.
 工具结果的文本里不带 base64（会被按文本计 token），只带 artifact 引用；
 图片本体在 OutputStore 里，桥接时按引用取回。
 
+**本中间件永不删除历史消息。** 删掉 ToolMessage 会让它的
+``AIMessage(tool_calls)`` 悬空，上游随即报
+``An assistant message with 'tool_calls' must be followed by tool messages``
+（400 invalid_request_error）。图片消息的收敛交给会话压缩
+（``CompactMiddleware``）统一处理，那里会连同 tool 组一起整理。
+
+注入是幂等的：桥接消息带 ``_mm_bridge_source`` 标记（源 ToolMessage 的稳定
+key），``before_model`` 只注入「上下文中还没有对应桥接消息」的源。因此进程
+重启、重复扫描、压缩丢弃桥接消息后重新注入，都不会产生重复图片块。
+
 Config keys (in faust.config.json, AI Provider section):
     MM_BRIDGE_MAX_SCAN  (int, default 6)   — max ToolMessages scanned per turn
-    MM_BRIDGE_REMOVE_SOURCE (bool, default False) — delete source ToolMessage after bridging
-    MM_BRIDGE_KEEP_TURNS (int, default 2)   — image message TTL in user turns; 0 = delete immediately
     MM_BRIDGE_MAX_PIXELS (int, default 2_000_000) — resize images whose total pixel count
         (width × height) exceeds this threshold before sending to the LLM. 0 disables resizing.
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
-import uuid
 from typing import Any
 
 from PIL import Image
 
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
-from langchain_core.messages import HumanMessage, RemoveMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
 from typing_extensions import override
 
 import faust_backend.config_loader as conf
 from faust_backend.runtime.output_store import get_output_store
+
+#: 桥接消息上标记源 ToolMessage 的 additional_kwargs 键（幂等去重依据）
+SOURCE_KEY_FIELD = "_mm_bridge_source"
 
 
 def _collect_urls(images: Any) -> list[str]:
@@ -46,9 +57,7 @@ def _collect_urls(images: Any) -> list[str]:
 class MultimodalBridgeMiddleware(AgentMiddleware):
     def __init__(self) -> None:
         super().__init__()
-        self._processed_tool_keys: set[str] = set()
-        self._ttl_by_message_id: dict[str, int] = {}
-        self._last_user_signature: str | None = None
+        self._max_pixels = 2_000_000
 
     @override
     def before_model(self, state: AgentState[Any], runtime: Runtime) -> dict[str, Any] | None:
@@ -57,26 +66,11 @@ class MultimodalBridgeMiddleware(AgentMiddleware):
             return None
 
         max_scan = max(1, int(getattr(conf, 'MM_BRIDGE_MAX_SCAN', 6) or 6))
-        remove_source = bool(getattr(conf, 'MM_BRIDGE_REMOVE_SOURCE', False))
-        keep_turns = max(0, int(getattr(conf, 'MM_BRIDGE_KEEP_TURNS', 2) or 2))
         self._max_pixels = max(0, int(getattr(conf, 'MM_BRIDGE_MAX_PIXELS', 2000000) or 2000000))
+        bridged = self._bridged_source_keys(messages)
 
         scanned = 0
         additions: list[HumanMessage] = []
-        removals: list[RemoveMessage] = []
-        remove_ids: set[str] = set()
-
-        # TTL decay: each new user turn reduces tracked image message lifespan by 1
-        user_turns = self._consume_new_user_turns(messages)
-        if user_turns > 0:
-            expired_ids: list[str] = []
-            for mid in list(self._ttl_by_message_id.keys()):
-                self._ttl_by_message_id[mid] = int(self._ttl_by_message_id[mid]) - user_turns
-                if self._ttl_by_message_id[mid] <= 0:
-                    expired_ids.append(mid)
-            for mid in expired_ids:
-                self._ttl_by_message_id.pop(mid, None)
-                self._append_removal(removals, remove_ids, mid)
 
         for msg in reversed(messages):
             if not isinstance(msg, ToolMessage):
@@ -86,52 +80,40 @@ class MultimodalBridgeMiddleware(AgentMiddleware):
                 break
 
             tool_key = self._tool_message_key(msg)
-            if tool_key in self._processed_tool_keys:
+            if tool_key in bridged:
                 continue
 
             payload = self._parse_tool_payload(msg)
             if payload is None:
                 continue
 
-            mm_msg = self._payload_to_mm_message(payload)
+            mm_msg = self._payload_to_mm_message(payload, tool_key)
             if mm_msg is None:
                 continue
 
-            self._processed_tool_keys.add(tool_key)
+            bridged.add(tool_key)
             additions.append(mm_msg)
-            src_mid = getattr(msg, "id", None)
-            if src_mid is not None:
-                src_mid = str(src_mid)
-                if remove_source or keep_turns == 0:
-                    self._append_removal(removals, remove_ids, src_mid)
-                else:
-                    self._ttl_by_message_id[src_mid] = keep_turns
 
-            mm_mid = getattr(mm_msg, "id", None)
-            if mm_mid is not None:
-                mm_mid = str(mm_mid)
-                if keep_turns == 0:
-                    self._append_removal(removals, remove_ids, mm_mid)
-                else:
-                    self._ttl_by_message_id[mm_mid] = keep_turns
-
-        if not additions and not removals:
+        if not additions:
             return None
 
+        # reversed 扫描顺序生成，恢复成时间顺序
         additions.reverse()
-        removals.reverse()
-        return {"messages": [*removals, *additions]}
+        return {"messages": additions}
 
     @override
     async def abefore_model(self, state: AgentState[Any], runtime: Runtime) -> dict[str, Any] | None:
         return self.before_model(state, runtime)
 
     @staticmethod
-    def _safe_int(value: Any, default: int) -> int:
-        try:
-            return max(0, int(value))
-        except (TypeError, ValueError):
-            return default
+    def _bridged_source_keys(messages: list[Any]) -> set[str]:
+        """上下文里已存在的桥接消息所对应的源 key（幂等去重依据）。"""
+        keys: set[str] = set()
+        for msg in messages:
+            source = (getattr(msg, "additional_kwargs", None) or {}).get(SOURCE_KEY_FIELD)
+            if source:
+                keys.add(str(source))
+        return keys
 
     @staticmethod
     def _parse_tool_payload(msg: ToolMessage) -> dict[str, Any] | None:
@@ -153,46 +135,24 @@ class MultimodalBridgeMiddleware(AgentMiddleware):
 
     @staticmethod
     def _tool_message_key(msg: ToolMessage) -> str:
+        """源 ToolMessage 的稳定 key。
+
+        优先用消息 id；缺 id 时用 tool_call_id + 内容 sha256（跨进程稳定，
+        因此进程重启后仍能识别「这张图已经桥接过了」）。
+        """
         mid = getattr(msg, "id", None)
         if mid is not None:
             return str(mid)
         tcid = getattr(msg, "tool_call_id", None)
-        content = getattr(msg, "content", "")
-        return f"fallback:{tcid}:{hash(str(content))}"
+        digest = hashlib.sha256(
+            str(getattr(msg, "content", "")).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"fallback:{tcid}:{digest}"
 
-    @staticmethod
-    def _append_removal(removals: list[RemoveMessage], remove_ids: set[str], mid: str) -> None:
-        if not mid or mid in remove_ids:
-            return
-        remove_ids.add(mid)
-        removals.append(RemoveMessage(id=mid))
-
-    def _consume_new_user_turns(self, messages: list[Any]) -> int:
-        signature = self._latest_user_signature(messages)
-        if signature is None:
-            return 0
-        if self._last_user_signature is None:
-            self._last_user_signature = signature
-            return 0
-        if signature == self._last_user_signature:
-            return 0
-        self._last_user_signature = signature
-        return 1
-
-    @staticmethod
-    def _latest_user_signature(messages: list[Any]) -> str | None:
-        for msg in reversed(messages):
-            if not isinstance(msg, HumanMessage):
-                continue
-            if bool((getattr(msg, "additional_kwargs", {}) or {}).get("_mm_bridge_generated", False)):
-                continue
-            mid = getattr(msg, "id", None)
-            if mid is not None:
-                return str(mid)
-        return None
-
-    def _payload_to_mm_message(self, payload: dict[str, Any]) -> HumanMessage | None:
-        max_pixels = getattr(self, "_max_pixels", 2000000)
+    def _payload_to_mm_message(
+        self, payload: dict[str, Any], source_key: str
+    ) -> HumanMessage | None:
+        max_pixels = self._max_pixels
         images: list[dict[str, Any]] = []
         for url in self._image_urls(payload):
             resized = self._maybe_resize_image_url(url, max_pixels)
@@ -207,7 +167,10 @@ class MultimodalBridgeMiddleware(AgentMiddleware):
         blocks.extend(images)
         return HumanMessage(
             content=blocks,
-            additional_kwargs={"_mm_bridge_generated": True},
+            additional_kwargs={
+                "_mm_bridge_generated": True,
+                SOURCE_KEY_FIELD: source_key,
+            },
         )
 
     @staticmethod
