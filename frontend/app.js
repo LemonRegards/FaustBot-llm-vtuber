@@ -4072,7 +4072,9 @@ import { initAsrBubble } from './libs/asr-bubble.js';
       const item = ev.target && ev.target.closest ? ev.target.closest('[data-subagent-name]') : null;
       if (!item) return;
       const name = String(item.getAttribute('data-subagent-name') || '');
-      subagent.renderFromCache(name);
+      // openByName：已有 WS 事件缓存时直接渲染缓存；缓存为空（例如事件断流、
+      // 或刚创建还没收到事件）时先 HTTP 拉一次历史快照，避免面板开成"暂无事件"空壳。
+      void subagent.openByName(name);
     });
   }
   if (hideAsrBubbleBtn){

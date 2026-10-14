@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator
 
 from faust_backend.logger import get_logger
+from faust_backend.runtime import subagent_events
 from faust_backend.runtime.model_retry import with_model_retry
 
 log = get_logger("faust.subagents")
@@ -53,7 +54,6 @@ class SubagentManager:
         self.identityPrefix = "你是 FaustBot 主 Agent 创建的 Subagent。你需要专注执行分配给你的子任务，并把输出保持为可观察、可审计的工作流。"
         self.abortEvents: dict[str, Event] = {}
         self._status_dirty: bool = False
-        self._event_queue: asyncio.Queue | None = None
         self._state_path = str(Path(self.checkpointerPath).with_name("subagents.json"))
         self._restored_payload = self._read_state_file()
 
@@ -246,12 +246,6 @@ class SubagentManager:
         dirty = self._status_dirty
         self._status_dirty = False
         return dirty
-
-    def get_event_queue(self) -> asyncio.Queue:
-        """获取 Subagent 流式事件队列（lazy-init），用于 WS 转发。"""
-        if self._event_queue is None:
-            self._event_queue = asyncio.Queue(maxsize=500)
-        return self._event_queue
 
     def _append_event(self, subagent: Subagent, event: dict[str, Any]) -> None:
         normalized = dict(event or {})
@@ -571,13 +565,12 @@ class SubagentManager:
                 yield event
                 subagent.outputStore[-1].append(event)
                 self._append_event(subagent, event)
-                # 推送 Subagent 流式事件到队列供 WS 转发
+                # 推送 Subagent 流式事件到进程级广播器，供 WS 转发。
+                # 注意：不能挂在 manager 实例上 —— manager 会在每次
+                # rebuild_runtime() 时被整体替换，而 WS 转发任务只订阅一次。
                 event_copy = dict(event)
                 event_copy["agent_id"] = f"subagent-{agent_name}"
-                try:
-                    self.get_event_queue().put_nowait(event_copy)
-                except asyncio.QueueFull:
-                    pass
+                subagent_events.publish(event_copy)
         finally:
             self.abortEvents.pop(agent_name, None)
             if subagent.status not in {"error", "stopped"}:

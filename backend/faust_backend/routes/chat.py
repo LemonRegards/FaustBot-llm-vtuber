@@ -15,6 +15,7 @@ import faust_backend.config_loader as conf
 import faust_backend.service_manager as service_manager
 import faust_backend.skill_manager as skill_manager
 from faust_backend.runtime import state
+from faust_backend.runtime import subagent_events
 from faust_backend.runtime.lifecycle import (
     invoke_agent_locked, stream_chat_agent_events, schedule_memory_record_sync,
     rebuild_runtime, _build_chat_model,
@@ -494,40 +495,45 @@ async def chat_websocket(websocket: WebSocket):
     agent_task: asyncio.Task | None = None
 
     # ── WS 连接级别的 Subagent 事件转发 ──
+    # 队列取自进程级广播器，而不是 state.subagent_manager：manager 会在每次
+    # rebuild_runtime() 时被整体替换（lifecycle._rebuild_subagent_manager），
+    # 若订阅 manager 实例内部队列，重建后本任务会永远监听一个孤儿队列，
+    # 前端 Subagent Panel 的实时事件就此断流（而摘要栏仍正常，故表现为"有时行有时不行"）。
     _subagent_fwd_stop = asyncio.Event()
     _subagent_fwd_task: asyncio.Task | None = None
-    _subagent_queue = None
-    if state.subagent_manager is not None:
-        _subagent_queue = state.subagent_manager.get_event_queue()
-        # 清空遗留事件
-        while _subagent_queue and not _subagent_queue.empty():
+    _subagent_queue = subagent_events.subscribe()
+
+    async def _push_subagents_summary_if_dirty() -> None:
+        """Subagent 状态变化实时刷新摘要栏。
+
+        原先只在主 Agent 流式响应过程中顺带推送，主 Agent 空闲时后台 Subagent
+        的创建/运行/结束不会反映到摘要栏。
+        """
+        manager = state.subagent_manager
+        if manager is not None and manager.consume_status_dirty():
+            await websocket.send_text(
+                json.dumps(_subagents_summary_payload(), ensure_ascii=False)
+            )
+
+    async def _forward_subagent_events():
+        while not _subagent_fwd_stop.is_set():
             try:
-                _subagent_queue.get_nowait()
-            except asyncio.QueueEmpty:
+                event = await asyncio.wait_for(_subagent_queue.get(), timeout=0.5)
+                await websocket.send_text(json.dumps(event, ensure_ascii=False))
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                break
+            try:
+                await _push_subagents_summary_if_dirty()
+            except asyncio.CancelledError:
                 break
 
-        async def _forward_subagent_events():
-            while not _subagent_fwd_stop.is_set():
-                try:
-                    event = await asyncio.wait_for(_subagent_queue.get(), timeout=0.5)
-                    assert event["agent_id"] != "main", "Subagent 事件队列中不应包含主 Agent 事件"
-                    await websocket.send_text(json.dumps(event, ensure_ascii=False))
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    break
-            # 排空
-            while _subagent_queue and not _subagent_queue.empty():
-                try:
-                    ev = _subagent_queue.get_nowait()
-                    await websocket.send_text(json.dumps(ev, ensure_ascii=False))
-                except asyncio.QueueEmpty:
-                    break
-
-        _subagent_fwd_task = asyncio.create_task(_forward_subagent_events())
+    _subagent_fwd_task = asyncio.create_task(_forward_subagent_events())
 
     async def _stop_forward_task():
         nonlocal _subagent_fwd_task
+        subagent_events.unsubscribe(_subagent_queue)
         if _subagent_fwd_task is None:
             return
         _subagent_fwd_stop.set()
@@ -539,6 +545,9 @@ async def chat_websocket(websocket: WebSocket):
                 await _subagent_fwd_task
             except Exception:
                 pass
+        except Exception as exc:
+            # 连接已断时 send_text 会失败；这里只记录，不让 finally 再抛异常
+            log.warning("Subagent 事件转发任务异常退出: %s", exc)
         _subagent_fwd_task = None
 
     try:
