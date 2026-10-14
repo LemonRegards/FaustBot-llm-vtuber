@@ -2229,6 +2229,17 @@ import { initAsrBubble } from './libs/asr-bubble.js';
         chatWs.onclose = ()=>{
           chatWs = null;
           chatWsReady = null;
+          // 断线时必须释放挂起的主动请求：sendToChat 在等一个 Promise，
+          // 而该 Promise 只在 done / interrupted / error 时 settle。
+          // 后端若因任何原因没发终结事件就断开（异常、进程重启、命令处理
+          // 抛错），不在这里兜底的话 currentChatRequest 会一直非 null，
+          // 输入框永久卡在"发送中"——表现为"再也无法互动"。
+          if (currentChatRequest){
+            try { currentChatRequest.reject(new Error('聊天连接已断开')); } catch(e){}
+            currentChatRequest = null;
+          }
+          passiveChatRequest = null;
+          agentIsProcessing = false;
           if (chatStatusEl) chatStatusEl.textContent = chatWsPersistent ? '重连中...' : '聊天未连接';
           // 常驻模式下断线自动重连（带退避），保证后端触发器/被动流始终有 WS 可推送
           if (chatWsPersistent){
