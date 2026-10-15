@@ -216,6 +216,9 @@ class CompactMiddleware(SummarizationMiddleware):
         self.threshold_ratio = float(threshold_ratio)
         self.threshold_tokens = threshold
         self.keep_rounds = max(1, int(keep_rounds))
+        # 输出上限曾导致摘要被截断时置位：本次进程内不再施加成本上限。
+        # 目的是自愈——否则每回合都会用过小的上限压缩失败、白烧一整轮调用。
+        self._cost_cap_bypassed = False
 
     # ── 触发与边界 ──
 
@@ -260,14 +263,17 @@ class CompactMiddleware(SummarizationMiddleware):
     # ── 压缩调用（复用主前缀以命中缓存） ──
 
     async def _acompact(self, messages: list[AnyMessage], on_delta=None) -> str:
-        """用**将被丢弃的那段历史**生成摘要。
+        """用**当前完整上下文 + 尾端指令**生成摘要。
 
         关键：payload 前缀必须与主请求逐字节一致（同样的 System、同样的工具
         schema），这样这次调用才能命中上游的前缀缓存。因此调用方传进来的是
-        `_to_summarize` —— 它是主请求 messages 的一个前缀，仍然是合法前缀。
+        完整 `messages`（= 主请求 messages 本身），**不要**改成只传将要丢弃的
+        段落：那样 payload 不再以对话起点开头，前缀缓存会整段失效，被丢弃段
+        之后的全部历史都按全价计费。
 
-        刻意**只**摘要被丢弃的部分：保留段本来就会留在上下文里，再把它们喂给
-        摘要模型纯属白花 token（保留段的体积可能很大）。
+        只有在用户显式打开 `COMPACT_COST_CONTROL_ENABLED`（默认关闭）时才会
+        牺牲这一点换成本：按 `COMPACT_MAX_INPUT_TOKENS` 裁掉最旧消息、按
+        `COMPACT_MAX_OUTPUT_TOKENS` 限制摘要输出。
 
         压缩调用不经过中间件链，因此这里自己修复悬空的 tool_calls；修复放在
         追加指令**之前**，使序列结尾的悬空走「注入占位」而不是被判为打断作废。
@@ -282,7 +288,9 @@ class CompactMiddleware(SummarizationMiddleware):
 
         import faust_backend.config_loader as conf
 
-        messages = self._apply_input_cap(list(messages))
+        cost_control = self._cost_control_active()
+        if cost_control:
+            messages = self._apply_input_cap(list(messages))
         payload: list[AnyMessage] = [
             *repair_dangling_tool_calls(list(messages)),
             HumanMessage(content=COMPACT_INSTRUCTION),
@@ -292,21 +300,21 @@ class CompactMiddleware(SummarizationMiddleware):
             if self.mock_tools
             else self.compact_model
         )
-        # 摘要输出上限：结构化摘要不需要很长，给个上限避免输出成本失控。
+        # 摘要输出上限：结构化摘要不需要很长。仅在成本控制开启时施加，
+        # 默认关闭则完全不设上限（摘要不可能被截断）。
         # 自定义模型/测试替身可能不支持 bind，失败时退化为不设上限而不是让压缩失败。
-        try:
-            max_out = int(getattr(conf, "COMPACT_MAX_OUTPUT_TOKENS", 0) or 0)
-        except (TypeError, ValueError):
-            max_out = 0
+        max_out = conf.COMPACT_MAX_OUTPUT_TOKENS if cost_control else 0
         if max_out > 0:
             try:
                 runnable = runnable.bind(max_tokens=max_out)
             except Exception as exc:  # noqa: BLE001
                 log.debug("压缩模型不支持 bind(max_tokens)，跳过输出上限: %s", exc)
+                max_out = 0
         # 瞬时故障在进程内重试（q27：先重试，再降级）
         runnable = runnable.with_retry()
         chunks: list[str] = []
         usage: Any = None
+        finish_reason: Any = None
         async for chunk in runnable.astream(
             payload,
             config={
@@ -317,6 +325,9 @@ class CompactMiddleware(SummarizationMiddleware):
             reported = getattr(chunk, "usage_metadata", None)
             if reported:
                 usage = reported
+            meta = getattr(chunk, "response_metadata", None) or {}
+            if meta.get("finish_reason"):
+                finish_reason = meta["finish_reason"]
             text = _content_to_text(getattr(chunk, "content", ""))
             if text:
                 chunks.append(text)
@@ -325,7 +336,50 @@ class CompactMiddleware(SummarizationMiddleware):
                     if hasattr(result, "__await__"):
                         await result
         self._log_usage(usage)
-        return "".join(chunks).strip()
+        summary = "".join(chunks).strip()
+        if self._is_truncated(max_out, finish_reason, usage):
+            # 摘要被截断 → 写回去就等于永久丢掉摘要没覆盖到的历史（原文会被
+            # _build_replacement 删掉）。这里按「压缩失败」处理：不写回 checkpoint，
+            # 把原因抛给调用方（自动压缩降级为不压缩；手动 /compact 显示失败卡片）。
+            # 同时放弃输出上限自愈，避免下一回合再用过小的上限白烧一次调用。
+            self._cost_cap_bypassed = True
+            raise RuntimeError(
+                f"摘要被 COMPACT_MAX_OUTPUT_TOKENS={max_out} 截断"
+                f"（finish_reason={finish_reason}），本次不写回 checkpoint 以免丢失"
+                "摘要未覆盖的历史；已自动放弃输出上限，请调大该值或关闭 "
+                "COMPACT_COST_CONTROL_ENABLED"
+            )
+        return summary
+
+    def _cost_control_active(self) -> bool:
+        """成本控制（输入/输出上限）当前是否生效。
+
+        由 `COMPACT_COST_CONTROL_ENABLED` 决定，默认关闭；一旦发生过截断，
+        本进程内不再施加，保证不会每回合重复付费。
+        """
+        import faust_backend.config_loader as conf
+
+        if self._cost_cap_bypassed:
+            return False
+        return bool(conf.COMPACT_COST_CONTROL_ENABLED)
+
+    @staticmethod
+    def _is_truncated(max_out: int, finish_reason: Any, usage: Any) -> bool:
+        """摘要输出是否被上限截断。
+
+        优先看 provider 上报的 `finish_reason == "length"`；部分 provider 不返回
+        它，退化为比较上报的 output_tokens 是否已触顶。两者都拿不到时无法判断，
+        按未截断处理（不额外制造假失败）。
+        """
+        if max_out <= 0:
+            return False
+        if str(finish_reason or "").lower() == "length":
+            return True
+        if isinstance(usage, dict):
+            output = usage.get("output_tokens")
+            if isinstance(output, int) and output >= max_out:
+                return True
+        return False
 
     @staticmethod
     def _log_usage(usage: Any) -> None:
@@ -348,18 +402,23 @@ class CompactMiddleware(SummarizationMiddleware):
 
     @staticmethod
     def _apply_input_cap(messages: list[AnyMessage]) -> list[AnyMessage]:
-        """粗粒度输入上限（默认关闭）。超限时从最旧的消息开始丢弃。
+        """粗粒度输入上限（仅在成本控制开启且 `COMPACT_MAX_INPUT_TOKENS` 非 0 时生效）。
 
-        这只是**安全阀**，不是触发判据——触发一律用 API 上报值。丢弃最旧消息会
-        缩小摘要的覆盖范围（那部分历史将永久丢失），所以默认 0（不限制），
-        仅在用户显式配置 `COMPACT_MAX_INPUT_TOKENS` 时启用。
+        超限时从**最旧**的消息开始丢弃。这只是成本安全阀，不是触发判据——触发
+        一律用 API 上报值。两个必须知道的代价：
+
+        1. **会打破前缀缓存**：payload 不再以对话起点开头，于是只有 System 与
+           工具定义还能命中缓存，被丢弃段之后的全部历史都按全价计费。它减少的是
+           token 总量，不代表单价更低。
+        2. **会缩小摘要覆盖范围**：被丢掉的最旧消息不会进入摘要（摘要看不到它们），
+           但那段历史照样会被 _build_replacement 删除 → 永久丢失。cap 过小时还会
+           丢进本轮本来要保留的尾部轮次。
+
+        所以默认 0（不限制），且必须配合 COMPACT_COST_CONTROL_ENABLED 一起打开。
         """
         import faust_backend.config_loader as conf
 
-        try:
-            cap = int(getattr(conf, "COMPACT_MAX_INPUT_TOKENS", 0) or 0)
-        except (TypeError, ValueError):
-            cap = 0
+        cap = conf.COMPACT_MAX_INPUT_TOKENS
         if cap <= 0:
             return messages
 
@@ -378,7 +437,8 @@ class CompactMiddleware(SummarizationMiddleware):
         if len(kept) != len(messages):
             log.warning(
                 "压缩输入超过 COMPACT_MAX_INPUT_TOKENS=%d（约 %d 字符），"
-                "已丢弃最旧的 %d 条消息；摘要覆盖范围会相应变小",
+                "已丢弃最旧的 %d 条消息：摘要覆盖范围变小（这部分历史将永久丢失），"
+                "且 payload 不再与主请求前缀一致（前缀缓存只剩 System 与工具定义可用）",
                 cap,
                 budget_chars,
                 len(messages) - len(kept),
