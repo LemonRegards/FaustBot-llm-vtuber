@@ -163,16 +163,12 @@ async def _compact_session_stream(websocket: WebSocket) -> str:
         await _notice("当前会话没有可压缩的上下文。")
         return "当前会话没有可压缩的上下文。"
 
-    await websocket.send_text(
-        json.dumps(_main_event_payload("compact_start"), ensure_ascii=False)
-    )
+    await _safe_send(websocket, _main_event_payload("compact_start"))
 
     async def _on_delta(text: str) -> None:
-        await websocket.send_text(
-            json.dumps(
-                _main_event_payload("compact_delta", content=text), ensure_ascii=False
-            )
-        )
+        # 走 _safe_send：连接中途断开时不能抛异常，否则会顺着 _acompact →
+        # force_compact 冒出去，让已经推送的压缩卡片停在无终态的状态。
+        await _safe_send(websocket, _main_event_payload("compact_delta", content=text))
 
     update = await middleware.force_compact(messages, on_delta=_on_delta)
     if not update:
@@ -226,10 +222,14 @@ async def _handle_slash_command(text: str, websocket: WebSocket | None = None) -
             await _compact_session_stream(websocket)
         except Exception as e:  # noqa: BLE001
             log.error("手动会话压缩失败: %s", e, exc_info=True)
-            await _safe_send(websocket, _main_event_payload("compact_done", ok=False))
+            reason = state.format_chat_error(e)
+            # 把失败原因一并塞进 compact_done：前端据此把卡片标成失败并显示原因，
+            # 否则卡片在失败时照样显示"完成"（ok 字段此前完全没人读）。
             await _safe_send(
-                websocket,
-                _main_event_payload("error", error=state.format_chat_error(e)),
+                websocket, _main_event_payload("compact_done", ok=False, error=reason)
+            )
+            await _safe_send(
+                websocket, _main_event_payload("error", error=reason)
             )
         else:
             # 压缩卡片已由 compact_done 收尾，这里再补终结事件释放前端请求状态

@@ -199,7 +199,12 @@ class _FakeWS:
         return [json.loads(t).get("type") for t in self.sent]
 
 
+_UNSET = object()
+
+
 class _FakeCompactMW:
+    """假压缩中间件：按 mode 复现四种真实结果，并流式吐两段摘要。"""
+
     def __init__(self, mode: str) -> None:
         self.mode = mode
 
@@ -209,7 +214,8 @@ class _FakeCompactMW:
         if self.mode == "empty":
             return None
         if on_delta:
-            await on_delta("## 目标与进度\n摘要")
+            await on_delta("## 目标与进度\n")
+            await on_delta("摘要正文")
         return {"messages": [HumanMessage(content="摘要")]}
 
 
@@ -222,70 +228,119 @@ class _FakeAgent:
             raise RuntimeError("模拟 aupdate_state 失败")
 
 
-async def _run_compact(mode: str, *, agent_fail: bool = False):
+def _install_compact_env(monkeypatch, *, mode: str, agent_fail: bool = False,
+                         messages=("hi",), middleware=_UNSET) -> "_FakeWS":
+    """把 /compact 依赖的全局状态全部改成 monkeypatch，测试结束自动还原。
+
+    直接给 state.compact_middleware / state.agent 赋值会泄漏给同一 pytest 进程里
+    后续所有测试，因此这里统一用 monkeypatch.setattr。
+    """
     from faust_backend.routes import chat as chat_route
     from faust_backend.runtime import state
 
     ws = _FakeWS()
-    state.compact_middleware = _FakeCompactMW(mode)
-    state.agent = _FakeAgent(fail=agent_fail)
+    monkeypatch.setattr(
+        state, "compact_middleware",
+        _FakeCompactMW(mode) if middleware is _UNSET else middleware,
+        raising=False,
+    )
+    monkeypatch.setattr(state, "agent", _FakeAgent(fail=agent_fail), raising=False)
 
     async def _messages():
-        return [HumanMessage(content="hi")]
+        return [HumanMessage(content=text) for text in messages]
 
-    original = chat_route.get_checkpoint_messages
-    chat_route.get_checkpoint_messages = _messages
-    try:
-        handled, reply = await chat_route._handle_slash_command("/compact", ws)
-    finally:
-        chat_route.get_checkpoint_messages = original
+    monkeypatch.setattr(chat_route, "get_checkpoint_messages", _messages)
+    return ws
+
+
+def _run_compact(monkeypatch, *, mode: str, agent_fail: bool = False, messages=("hi",),
+                 middleware=_UNSET):
+    from faust_backend.routes import chat as chat_route
+
+    ws = _install_compact_env(
+        monkeypatch, mode=mode, agent_fail=agent_fail, messages=messages,
+        middleware=middleware,
+    )
+    handled, reply = asyncio.run(chat_route._handle_slash_command("/compact", ws))
     return handled, reply, ws
 
 
-@pytest.mark.parametrize(
-    "mode,agent_fail",
-    [
-        ("ok", False),        # 正常压缩
-        ("empty", False),     # 没有可压缩的轮次
-        ("ok", True),         # 写回 checkpoint 失败
-        ("raise", False),     # 压缩调用抛异常
-    ],
-)
-def test_compact_always_emits_terminal_event(mode, agent_fail):
-    """四种结果都必须发终结事件，否则前端输入框会永久卡在"发送中"。"""
-    handled, _reply, ws = asyncio.run(_run_compact(mode, agent_fail=agent_fail))
-    types = ws.event_types()
+def _payloads(ws) -> list[dict]:
+    return [json.loads(t) for t in ws.sent]
+
+
+def _delta_text(ws) -> str:
+    return "".join(
+        p.get("content", "") for p in _payloads(ws) if p.get("type") == "compact_delta"
+    )
+
+
+# (mode, agent_fail) -> 必须逐字匹配的事件类型序列
+EXPECTED_SEQUENCES = {
+    ("ok", False): ["compact_start", "compact_delta", "compact_delta", "compact_done", "done"],
+    ("empty", False): ["compact_start", "compact_delta", "compact_done", "done"],
+    ("ok", True): ["compact_start", "compact_delta", "compact_delta", "compact_done", "error"],
+    ("raise", False): ["compact_start", "compact_done", "error"],
+}
+
+
+@pytest.mark.parametrize("mode,agent_fail", list(EXPECTED_SEQUENCES))
+def test_compact_event_sequence_is_stable(monkeypatch, mode, agent_fail):
+    """四条路径的事件顺序必须稳定，前端按这个顺序渲染卡片并释放请求。
+
+    顺序错乱（例如 done 早于 compact_done）会让卡片状态错位；缺终结事件会让
+    sendToChat 的 Promise 永不 settle，输入框永久卡在"发送中"。
+    """
+    handled, _reply, ws = _run_compact(monkeypatch, mode=mode, agent_fail=agent_fail)
+    payloads = _payloads(ws)
+    types = [p.get("type") for p in payloads]
     assert handled is True
+    assert types == EXPECTED_SEQUENCES[(mode, agent_fail)]
     assert TERMINAL_EVENTS & set(types), f"缺少终结事件，前端会卡死: {types}"
-    # 压缩卡片事件应照常推送
-    assert "compact_start" in types
-    assert "compact_done" in types
+    assert all(p.get("agent_id") == "main" for p in payloads)
+    if mode == "ok":
+        # 增量文本要能被前端拼成完整摘要（否则卡片是空的）
+        assert _delta_text(ws) == "## 目标与进度\n摘要正文"
 
 
-def test_compact_without_messages_still_terminates():
+@pytest.mark.parametrize("mode,agent_fail", [("ok", True), ("raise", False)])
+def test_compact_failure_marks_card_failed(monkeypatch, mode, agent_fail):
+    """失败时 compact_done 必须带 ok=False + 原因，前端据此把卡片标成失败态。"""
+    _handled, _reply, ws = _run_compact(monkeypatch, mode=mode, agent_fail=agent_fail)
+    done = [p for p in _payloads(ws) if p.get("type") == "compact_done"]
+    assert done, "失败路径也必须收尾压缩卡片"
+    assert done[-1].get("ok") is False, done[-1]
+    assert done[-1].get("error"), done[-1]
+
+
+def test_compact_success_carries_no_failure_flag(monkeypatch):
+    _handled, _reply, ws = _run_compact(monkeypatch, mode="ok")
+    done = [p for p in _payloads(ws) if p.get("type") == "compact_done"][-1]
+    assert done.get("ok") is not False
+    assert "error" not in done
+
+
+def test_compact_without_messages_still_terminates(monkeypatch):
     """会话为空时也要给出卡片与终结事件，而不是静默无反应。"""
-    from faust_backend.routes import chat as chat_route
-    from faust_backend.runtime import state
-
-    ws = _FakeWS()
-    state.compact_middleware = _FakeCompactMW("ok")
-
-    async def _no_messages():
-        return []
-
-    original = chat_route.get_checkpoint_messages
-    chat_route.get_checkpoint_messages = _no_messages
-    try:
-        handled, _reply = asyncio.run(
-            chat_route._handle_slash_command("/compact", ws)
-        )
-    finally:
-        chat_route.get_checkpoint_messages = original
-
-    types = ws.event_types()
+    handled, _reply, ws = _run_compact(monkeypatch, mode="ok", messages=())
     assert handled is True
-    assert TERMINAL_EVENTS & set(types), types
-    assert "compact_done" in types
+    assert [p.get("type") for p in _payloads(ws)] == [
+        "compact_start", "compact_delta", "compact_done", "done",
+    ]
+    assert "没有可压缩的上下文" in _delta_text(ws)
+
+
+def test_compact_missing_middleware_fails_visibly(monkeypatch):
+    """中间件未就绪（异常发生在推 compact_start 之前）：仍要有失败卡片 + 终结事件。
+
+    这条路径没有 compact_start，前端靠 compact_done 兜底建卡片，所以 ok/error
+    字段必须带上，且必须补 error 事件释放 sendToChat 的 Promise。
+    """
+    handled, _reply, ws = _run_compact(monkeypatch, mode="ok", middleware=None)
+    types = [p.get("type") for p in _payloads(ws)]
+    assert handled is True
+    assert types == ["compact_done", "error"], types
+    assert _payloads(ws)[0].get("ok") is False
 
 
 def test_safe_send_swallows_closed_socket():
@@ -298,3 +353,30 @@ def test_safe_send_swallows_closed_socket():
 
     ok = asyncio.run(chat_route._safe_send(_Dead(), {"type": "done"}))
     assert ok is False
+
+
+def test_compact_survives_dead_socket(monkeypatch):
+    """连接中途断开时 /compact 也不能把异常抛回接收循环，且必须尝试收尾。"""
+    from faust_backend.routes import chat as chat_route
+
+    class _DeadWS:
+        def __init__(self):
+            self.attempts: list[str] = []
+
+        async def send_text(self, text):
+            self.attempts.append(text)
+            raise RuntimeError("socket closed")
+
+    from faust_backend.runtime import state
+
+    monkeypatch.setattr(state, "compact_middleware", _FakeCompactMW("ok"), raising=False)
+    monkeypatch.setattr(state, "agent", _FakeAgent(), raising=False)
+
+    async def _messages():
+        return [HumanMessage(content="hi")]
+
+    monkeypatch.setattr(chat_route, "get_checkpoint_messages", _messages)
+    ws = _DeadWS()
+    handled, reply = asyncio.run(chat_route._handle_slash_command("/compact", ws))
+    assert handled is True and reply is None
+    assert ws.attempts, "即使发送失败也应尝试过推送事件（失败由 _safe_send 吞掉）"
